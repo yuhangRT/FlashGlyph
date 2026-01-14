@@ -1,0 +1,19 @@
+# 训练配置示例 (train.py)
+
+# 数据集路径
+dataset_json: "demodataset/annotations/demo_data.json"
+
+# 训练参数
+batch_size: 4  # 小数据集可以使用较大的 batch size
+grad_accum: 1
+learning_rate: 1e-4
+
+# 训练轮次
+max_epochs: 10  # 小数据集可以训练更多轮
+
+# 数据集划分
+train_split: 1455
+val_split: 363
+
+# 保存路径
+output_dir: "./experiments/demo_distill"

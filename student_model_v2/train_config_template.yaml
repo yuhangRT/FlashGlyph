@@ -1,0 +1,74 @@
+# AnyText2 LCM-LoRA distillation template (2x4090, 64GB RAM)
+
+model:
+  config: models_yaml/anytext2_sd15.yaml
+  teacher_ckpt: models/anytext_v2.0.ckpt
+  output_dir: student_model_v2/checkpoints
+
+data:
+  cache_dir: dataset_cache/anytext2
+  auto_list_path: dataset_cache/anytext2/train_paths.list
+  # 使用小数据集进行测试
+  dataset_json:
+    # - demodataset/annotations/demo_data.json
+    # 大数据集（注释掉）：
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/Art/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/COCO_Text/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/icdar2017rctw/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/LSVT/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/mlt2019/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/MTWI2018/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/ReCTS/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/laion_word/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_1of5/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_2of5/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_3of5/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_4of5/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_5of5/data_v1.2b.json
+  resolution: 512
+  wm_thresh: 1.0
+  streaming: true
+  streaming_threshold_mb: 200
+
+train:
+  use_optimized: true  # true to use train_lcm_anytext_v2_2.py
+  train_batch_size: 4
+  gradient_accumulation_steps: 2
+  learning_rate: 5e-5
+  max_train_steps: 5000
+  max_epochs: 0  # set >0 to use epoch-driven training (overrides max_train_steps)
+  resume_path: ""  # e.g. student_model_v2/checkpoints/checkpoint-2000
+  resume_optimizer: false
+  mixed_precision: fp16
+  lora_rank: 64
+  lora_alpha: 64
+  lora_dropout: 0.0
+  num_inference_steps: 50
+  cfg_scale: 7.5
+  num_workers: 10
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+  mp_context: ""
+  worker_num_threads: 1
+  cv2_num_threads: 1
+  allow_tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  save_steps: 2000
+  save_epochs: 0  # set >0 to save checkpoints by epoch
+  logging_steps: 10
+  log_image_steps: 500  # 0 to disable preview images
+  log_image_samples: 4
+  log_image_dir: ""  # empty uses output_dir/image_log/train
+  eval_batches: 1
+  eval_num_workers: 0
+  eval_timeout: 0
+  train_ratio: 0.98
+  val_ratio: 0.01
+  test_ratio: 0.01
+  seed: 42
+
+system:
+  num_gpus: 2
+  notes: "Use accelerate launch --multi_gpu. Adjust train_batch_size if OOM."

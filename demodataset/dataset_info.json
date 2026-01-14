@@ -1,0 +1,9 @@
+{
+  "total_samples": 1819,
+  "train_split": 1455,
+  "val_split": 363,
+  "sources": {
+    "laion": 1091,
+    "wukong": 727
+  }
+}
