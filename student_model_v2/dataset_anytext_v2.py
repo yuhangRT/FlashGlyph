@@ -30,6 +30,36 @@ except Exception:
 STREAMING_THRESHOLD_MB = 200
 _INDEX_STRUCT = struct.Struct("Q")
 _INDEX_ITEM_SIZE = _INDEX_STRUCT.size
+_FONT_CACHE = {}
+
+
+def _get_cached_font(font_path, size):
+    key = (font_path, int(size))
+    cached = _FONT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        cached = ImageFont.truetype(font_path, size=int(size))
+    except OSError:
+        _FONT_CACHE.clear()
+        try:
+            cached = ImageFont.truetype(font_path, size=int(size))
+        except OSError:
+            return ImageFont.load_default()
+    _FONT_CACHE[key] = cached
+    return cached
+
+
+def _get_font_variant(font, size):
+    if isinstance(font, str):
+        return _get_cached_font(font, size)
+    font_path = getattr(font, "path", None)
+    if font_path:
+        return _get_cached_font(font_path, size)
+    try:
+        return font.font_variant(size=int(size))
+    except Exception:
+        return ImageFont.load_default()
 
 
 def _json_loads(raw):
@@ -296,11 +326,9 @@ class JsonlIndex:
 
 
 def draw_glyph(font, text):
-    if isinstance(font, str):
-        font = ImageFont.truetype(font, size=60)
     g_size = 50
     width, height = (512, 80)
-    new_font = font.font_variant(size=g_size)
+    new_font = _get_font_variant(font, g_size)
     img = Image.new(mode="1", size=(width, height), color=0)
     draw = ImageDraw.Draw(img)
 
@@ -361,7 +389,7 @@ def draw_glyph2(font, text, polygon, color, scale=1.0, width=512, height=512, ad
         def adjust_font_size(min_size, max_size, text):
             while min_size < max_size:
                 mid_size = (min_size + max_size) // 2
-                new_font = font.font_variant(size=int(mid_size))
+                new_font = _get_font_variant(font, int(mid_size))
                 bbox = draw.textbbox((0, 0), text=text, font=new_font)
                 text_w = bbox[2] - bbox[0]
                 text_h = bbox[3] - bbox[1]
@@ -372,7 +400,7 @@ def draw_glyph2(font, text, polygon, color, scale=1.0, width=512, height=512, ad
             return max_size - 1
 
         optimal_font_size = adjust_font_size(1, int(min_dim), text)
-        new_font = font.font_variant(size=int(optimal_font_size))
+        new_font = _get_font_variant(font, int(optimal_font_size))
 
         if add_space and not vert:
             for i in range(1, 100):
@@ -633,6 +661,7 @@ class AnyTextMockDataset(Dataset):
         self.size = size
         self.resolution = resolution
         self.max_lines = max_lines
+        self.font_path = font_path
         self.font = ImageFont.truetype(font_path, size=60)
         self.mask_img_prob = mask_img_prob
         self.fix_masked_img_bug = fix_masked_img_bug
@@ -673,7 +702,7 @@ class AnyTextMockDataset(Dataset):
             x_end = x_start + random.randint(100, 150)
             glyph[0, y_start:y_end, x_start:x_end] = 1.0
             glyphs.append(glyph)
-            gly_line.append(draw_glyph(self.font, random.choice(texts)))
+            gly_line.append(draw_glyph(self.font_path, random.choice(texts)))
 
             pos = torch.zeros(1, self.resolution, self.resolution)
             pos[0, y_start:y_end, x_start:x_end] = 1.0
@@ -765,6 +794,7 @@ class RealAnyTextDataset(Dataset):
         if self.data_roots:
             self.data_root = self.data_roots[0]
 
+        self.font_path = font_path
         self.font = ImageFont.truetype(font_path, size=60)
         self.max_lines = max_lines
         self.max_chars = max_chars
@@ -872,11 +902,11 @@ class RealAnyTextDataset(Dataset):
         glyphs = []
         gly_line = []
         for idx, text in enumerate(texts):
-            gly_line.append(draw_glyph(self.font, text))
+            gly_line.append(draw_glyph(self.font_path, text))
             glyph_color = (colors[idx] * 255).astype(np.uint8)
             glyphs.append(
                 draw_glyph2(
-                    self.font,
+                    self.font_path,
                     text,
                     polygons[idx],
                     glyph_color,
