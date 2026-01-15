@@ -32,13 +32,15 @@ data:
 
 train:
   use_optimized: true  # true to use train_lcm_anytext_v2_2.py
+  add_time_suffix: true  # create output_dir/train_<time> for each new run (disabled when resuming)
   train_batch_size: 4
   gradient_accumulation_steps: 2
-  learning_rate: 5e-5
-  max_train_steps: 5000
+  learning_rate: 1e-4 # 5e-5
+  max_train_steps: 10000
   max_epochs: 0  # set >0 to use epoch-driven training (overrides max_train_steps)
   resume_path: ""  # e.g. student_model_v2/checkpoints/checkpoint-2000
   resume_optimizer: false
+  resume_add_steps: 3000  # 0 uses max_train_steps when resuming
   mixed_precision: fp16
   lora_rank: 64
   lora_alpha: 64
@@ -55,12 +57,12 @@ train:
   allow_tf32: true
   cudnn_benchmark: true
   matmul_precision: high
-  save_steps: 2000
+  save_steps: 200
   save_epochs: 0  # set >0 to save checkpoints by epoch
   logging_steps: 10
-  log_image_steps: 500  # 0 to disable preview images
+  log_image_steps: 200  # 0 to disable preview images
   log_image_samples: 4
-  log_image_dir: ""  # empty uses output_dir/image_log/train
+  log_image_dir: ""  # empty uses output_dir/train_img
   eval_batches: 1
   eval_num_workers: 0
   eval_timeout: 0

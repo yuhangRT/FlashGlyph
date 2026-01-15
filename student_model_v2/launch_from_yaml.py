@@ -1,5 +1,6 @@
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 repo_root = Path(__file__).resolve().parent.parent
@@ -43,6 +44,7 @@ def build_args(config):
         "pin_memory",
         "allow_tf32",
         "cudnn_benchmark",
+        "resume_optimizer",
     }
 
     for key, value in config.items():
@@ -125,6 +127,13 @@ def main():
         prepare_cache(cfg)
         return
     use_optimized = bool(cfg.pop("use_optimized", False))
+    add_time_suffix = bool(cfg.pop("add_time_suffix", False))
+    resume_path = cfg.get("resume_path")
+    if not resume_path:
+        output_dir = cfg.get("output_dir")
+        if output_dir and add_time_suffix:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            cfg["output_dir"] = str(Path(output_dir) / f"train_{timestamp}")
     cli_args = build_args(cfg)
     if args.print_args:
         print(" ".join(cli_args))

@@ -31,6 +31,7 @@ STREAMING_THRESHOLD_MB = 200
 _INDEX_STRUCT = struct.Struct("Q")
 _INDEX_ITEM_SIZE = _INDEX_STRUCT.size
 _FONT_CACHE = {}
+_FONT_CACHE_MAX = 100
 
 
 def _get_cached_font(font_path, size):
@@ -38,6 +39,8 @@ def _get_cached_font(font_path, size):
     cached = _FONT_CACHE.get(key)
     if cached is not None:
         return cached
+    if len(_FONT_CACHE) >= _FONT_CACHE_MAX:
+        _FONT_CACHE.clear()
     try:
         cached = ImageFont.truetype(font_path, size=int(size))
     except OSError:
@@ -53,13 +56,14 @@ def _get_cached_font(font_path, size):
 def _get_font_variant(font, size):
     if isinstance(font, str):
         return _get_cached_font(font, size)
-    font_path = getattr(font, "path", None)
-    if font_path:
-        return _get_cached_font(font_path, size)
     try:
         return font.font_variant(size=int(size))
     except Exception:
-        return ImageFont.load_default()
+        pass
+    font_path = getattr(font, "path", None)
+    if font_path:
+        return _get_cached_font(font_path, size)
+    return ImageFont.load_default()
 
 
 def _json_loads(raw):
@@ -702,7 +706,7 @@ class AnyTextMockDataset(Dataset):
             x_end = x_start + random.randint(100, 150)
             glyph[0, y_start:y_end, x_start:x_end] = 1.0
             glyphs.append(glyph)
-            gly_line.append(draw_glyph(self.font_path, random.choice(texts)))
+            gly_line.append(draw_glyph(self.font, random.choice(texts)))
 
             pos = torch.zeros(1, self.resolution, self.resolution)
             pos[0, y_start:y_end, x_start:x_end] = 1.0
@@ -902,11 +906,11 @@ class RealAnyTextDataset(Dataset):
         glyphs = []
         gly_line = []
         for idx, text in enumerate(texts):
-            gly_line.append(draw_glyph(self.font_path, text))
+            gly_line.append(draw_glyph(self.font, text))
             glyph_color = (colors[idx] * 255).astype(np.uint8)
             glyphs.append(
                 draw_glyph2(
-                    self.font_path,
+                    self.font,
                     text,
                     polygons[idx],
                     glyph_color,

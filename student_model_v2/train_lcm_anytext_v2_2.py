@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import re
 import sys
 import time
 from contextlib import nullcontext
@@ -365,6 +366,33 @@ def sanitize_hparams(config):
     return sanitized
 
 
+def _parse_checkpoint_step(resume_path):
+    if not resume_path:
+        return None
+    name = os.path.basename(os.path.normpath(resume_path))
+    match = re.search(r"checkpoint-(\d+)", name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _infer_latest_step(output_dir, image_dir):
+    max_step = 0
+    out_dir = Path(output_dir)
+    if out_dir.exists():
+        for entry in out_dir.glob("checkpoint-*"):
+            step = _parse_checkpoint_step(entry.name)
+            if step:
+                max_step = max(max_step, step)
+    img_dir = Path(image_dir)
+    if img_dir.exists():
+        for entry in img_dir.glob("step_*.png"):
+            match = re.search(r"step_(\d+)", entry.name)
+            if match:
+                max_step = max(max_step, int(match.group(1)))
+    return max_step or None
+
+
 def main():
     parser = argparse.ArgumentParser(description="LCM-LoRA distillation for AnyText2 (v2)")
     parser.add_argument("--config", type=str, default="models_yaml/anytext2_sd15.yaml")
@@ -374,6 +402,12 @@ def main():
     parser.add_argument("--use_mock_dataset", action="store_true")
     parser.add_argument("--resume_path", type=str, default="")
     parser.add_argument("--resume_optimizer", action="store_true", default=False)
+    parser.add_argument(
+        "--resume_add_steps",
+        type=int,
+        default=0,
+        help="Additional steps to run after resuming. 0 uses max_train_steps when resuming.",
+    )
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -474,6 +508,9 @@ def main():
     if resume_path:
         resume_path = str((Path(__file__).parent.parent / resume_path).resolve()) if not os.path.isabs(resume_path) else resume_path
         student = PeftModel.from_pretrained(student, resume_path, is_trainable=True)
+        resume_step_hint = _parse_checkpoint_step(resume_path)
+        if accelerator.is_local_main_process:
+            accelerator.print(f"[resume] Using LoRA weights from {resume_path}")
     else:
         lora_config = LoraConfig(
             r=args.lora_rank,
@@ -640,11 +677,6 @@ def main():
         total_updates = min(total_updates, args.max_train_steps)
     total_updates = max(1, total_updates)
 
-    progress_bar = tqdm(
-        total=total_updates,
-        disable=not accelerator.is_local_main_process,
-        desc="Training",
-    )
     global_step = 0
     start_epoch = 0
     last_log_time = time.perf_counter()
@@ -653,7 +685,7 @@ def main():
 
     non_blocking = bool(args.pin_memory)
     uncond_cache = UncondCache()
-    log_image_dir = args.log_image_dir or os.path.join(args.output_dir, "image_log", "train")
+    log_image_dir = args.log_image_dir or os.path.join(args.output_dir, "train_img")
 
     def run_eval(split_name, loader):
         if loader is None or args.eval_batches <= 0:
@@ -710,10 +742,12 @@ def main():
         if losses and accelerator.is_local_main_process:
             avg_loss = sum(losses) / len(losses)
             accelerator.log({f"{split_name}/loss": avg_loss}, step=global_step)
+            accelerator.print(f"[eval] {split_name} loss={avg_loss:.6f}")
         teacher_wrapper.base_model.train()
         student_wrapper.base_model.train()
         accelerator.wait_for_everyone()
 
+    resume_loaded = False
     if resume_path and args.resume_optimizer:
         state_path = os.path.join(resume_path, "training_state.pt")
         if os.path.exists(state_path):
@@ -724,11 +758,64 @@ def main():
             optimizer_state = state.get("optimizer_state")
             if optimizer_state:
                 optimizer.load_state_dict(optimizer_state)
+            resume_loaded = True
             if accelerator.is_local_main_process:
                 accelerator.print(f"[resume] Loaded optimizer state from {state_path}")
+                accelerator.print(
+                    f"[resume] global_step={global_step}, total_updates={total_updates}, "
+                    f"remaining={max(total_updates - global_step, 0)}"
+                )
+
+    if resume_path and not resume_loaded:
+        resume_source = None
+        if resume_step_hint:
+            global_step = resume_step_hint
+            resume_source = "checkpoint name"
+        else:
+            inferred_step = _infer_latest_step(args.output_dir, log_image_dir)
+            if inferred_step:
+                global_step = inferred_step
+                resume_source = "output_dir/image_log"
+        if resume_source and accelerator.is_local_main_process:
+            accelerator.print(
+                "[resume] training_state.pt not found; "
+                f"using step={global_step} inferred from {resume_source}."
+            )
+            accelerator.print(
+                f"[resume] global_step={global_step}, total_updates={total_updates}, "
+                f"remaining={max(total_updates - global_step, 0)}"
+            )
+
+    resume_add_steps = int(args.resume_add_steps)
+    if resume_path and resume_add_steps <= 0 and args.max_epochs <= 0 and args.max_train_steps > 0:
+        resume_add_steps = int(args.max_train_steps)
+
+    if resume_path and resume_add_steps > 0:
+        total_updates = global_step + resume_add_steps
+        required_epochs = max(1, math.ceil(total_updates / steps_per_epoch))
+        if required_epochs > max_epochs:
+            if accelerator.is_local_main_process:
+                accelerator.print(
+                    f"[resume] Extending max_epochs from {max_epochs} to {required_epochs} "
+                    f"for resume_add_steps={resume_add_steps}."
+                )
+            max_epochs = required_epochs
+        if accelerator.is_local_main_process:
+            accelerator.print(
+                f"[resume] resume_add_steps={resume_add_steps}, total_updates={total_updates}, "
+                f"remaining={max(total_updates - global_step, 0)}"
+            )
+
+    progress_bar = tqdm(
+        total=total_updates,
+        disable=not accelerator.is_local_main_process,
+        desc="Training",
+    )
 
     if global_step > 0:
         progress_bar.update(min(global_step, total_updates))
+        last_log_step = global_step
+        last_log_time = time.perf_counter()
 
     def save_training_state(save_dir, epoch_idx):
         state = {
@@ -818,6 +905,22 @@ def main():
                             postfix["mem_gb"] = f"{mem_gb:.1f}"
                             torch.cuda.reset_peak_memory_stats(device)
                         progress_bar.set_postfix(postfix, refresh=True)
+                        progress_pct = (global_step / total_updates) * 100.0
+                        progress_bar.write(
+                            "Training (epoch {epoch}/{total}): {step}/{total_steps} ({pct:.1f}%) "
+                            "loss={loss} ema={ema} lr={lr} it/s={it_s}{mem}".format(
+                                epoch=epoch + 1,
+                                total=max_epochs,
+                                step=global_step,
+                                total_steps=total_updates,
+                                pct=progress_pct,
+                                loss=postfix["loss"],
+                                ema=postfix["ema"],
+                                lr=postfix["lr"],
+                                it_s=postfix["it/s"],
+                                mem=f" mem_gb={postfix.get('mem_gb', 'n/a')}",
+                            )
+                        )
                         accelerator.log(
                             {
                                 "train/loss": loss_val,
@@ -842,11 +945,12 @@ def main():
                                 max_samples=args.log_image_samples,
                             )
 
-                    if args.save_steps > 0 and global_step % args.save_steps == 0 and accelerator.is_local_main_process:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        unwrapped = accelerator.unwrap_model(student)
-                        unwrapped.save_pretrained(save_path)
-                        save_training_state(save_path, epoch)
+                    if args.save_steps > 0 and global_step % args.save_steps == 0:
+                        if accelerator.is_local_main_process:
+                            save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                            unwrapped = accelerator.unwrap_model(student)
+                            unwrapped.save_pretrained(save_path)
+                            save_training_state(save_path, epoch)
                         run_eval("val", val_loader)
 
                 if global_step >= total_updates:
@@ -861,7 +965,7 @@ def main():
                 unwrapped = accelerator.unwrap_model(student)
                 unwrapped.save_pretrained(save_path)
                 save_training_state(save_path, epoch + 1)
-                run_eval("val", val_loader)
+            run_eval("val", val_loader)
 
         if global_step >= total_updates:
             break
@@ -871,8 +975,8 @@ def main():
         unwrapped = accelerator.unwrap_model(student)
         unwrapped.save_pretrained(save_path)
         save_training_state(save_path, max_epochs)
-        run_eval("val", val_loader)
-        run_eval("test", test_loader)
+    run_eval("val", val_loader)
+    run_eval("test", test_loader)
 
 
 if __name__ == "__main__":
