@@ -1,3 +1,4 @@
+# CUDA_VISIBLE_DEVICES=1,2 python student_model_v2/oom_guard.py --min-available-gb 4 accelerate launch --num_processes 2 student_model_v2/launch_from_yaml.py --config student_model_v2/train_config_template_v3.yaml
 import argparse
 import math
 import os
@@ -31,6 +32,7 @@ from student_model_v2.dataset_anytext_v2 import (
     RealAnyTextDataset,
     collate_fn_anytext,
 )
+from student_model_v2.losses import MultiDomainTextLoss
 from student_model_v2.lcm_utils_v2 import (
     add_noise,
     apply_cfg,
@@ -408,7 +410,7 @@ def warmup_cosine_scale(step, total_steps, warmup_steps, min_ratio):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LCM-LoRA distillation for AnyText2 (v2)")
+    parser = argparse.ArgumentParser(description="LCM-LoRA distillation for AnyText2 (v3)")
     parser.add_argument("--config", type=str, default="models_yaml/anytext2_sd15.yaml")
     parser.add_argument("--teacher_ckpt", type=str, default="models/anytext_v2.0.ckpt")
     parser.add_argument("--output_dir", type=str, default="student_model_v2/checkpoints")
@@ -426,6 +428,15 @@ def main():
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--loss_ffl_weight", type=float, default=0.05)
+    parser.add_argument("--loss_grad_weight", type=float, default=0.05)
+    parser.add_argument("--ffl_alpha", type=float, default=1.0)
+    parser.add_argument("--ffl_patch_factor", type=int, default=1)
+    parser.add_argument("--ffl_ave_spectrum", action="store_true", default=False)
+    parser.add_argument("--ffl_log_matrix", action="store_true", default=False)
+    parser.add_argument("--ffl_batch_matrix", action="store_true", default=False)
+    parser.add_argument("--loss_mask_key", type=str, default="hint", choices=["hint", "positions", "inv_mask"])
+    parser.add_argument("--loss_text_weight", type=float, default=5.0)
     parser.add_argument(
         "--lr_scheduler",
         type=str,
@@ -714,6 +725,38 @@ def main():
         else:
             log_image_dir = os.path.join(args.output_dir, "train_img")
 
+    criterion = MultiDomainTextLoss(
+        ffl_weight=args.loss_ffl_weight,
+        grad_weight=args.loss_grad_weight,
+        ffl_alpha=args.ffl_alpha,
+        ffl_patch_factor=args.ffl_patch_factor,
+        ffl_ave_spectrum=args.ffl_ave_spectrum,
+        ffl_log_matrix=args.ffl_log_matrix,
+        ffl_batch_matrix=args.ffl_batch_matrix,
+        text_weight=args.loss_text_weight,
+    ).to(device)
+
+    def get_text_mask(batch):
+        key = args.loss_mask_key
+        mask = None
+        if key == "hint":
+            mask = batch.get("hint")
+        elif key == "positions":
+            positions = batch.get("positions")
+            if positions:
+                mask = torch.stack(positions, dim=0).amax(dim=0)
+        elif key == "inv_mask":
+            inv_mask = batch.get("inv_mask")
+            if inv_mask is not None:
+                mask = 1.0 - inv_mask
+        else:
+            mask = batch.get("hint")
+        if mask is None:
+            return None
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        return mask.float()
+
     def run_eval(split_name, loader):
         if loader is None or args.eval_batches <= 0:
             return
@@ -723,6 +766,9 @@ def main():
         teacher_wrapper.base_model.eval()
         student_wrapper.base_model.eval()
         losses = []
+        lcm_losses = []
+        ffl_losses = []
+        grad_losses = []
         with torch.inference_mode():
             for i, batch in enumerate(loader):
                 if i >= args.eval_batches:
@@ -763,13 +809,33 @@ def main():
                     pred_x0_student = predict_x0_from_eps(
                         noisy_latents, timesteps, noise_pred_student, alphas_cumprod
                     )
-                    loss = compute_lcm_loss(pred_x0_student, target_x0, loss_type="huber")
+                    text_mask = get_text_mask(batch)
+                    if text_mask is not None:
+                        text_mask = text_mask.to(device, non_blocking=non_blocking)
+                    loss, loss_dict = criterion(pred_x0_student, target_x0, mask=text_mask)
                 losses.append(loss.detach().float().item())
+                lcm_losses.append(loss_dict["lcm"].detach().float().item())
+                ffl_losses.append(loss_dict["ffl"].detach().float().item())
+                grad_losses.append(loss_dict["grad"].detach().float().item())
 
         if losses and accelerator.is_local_main_process:
             avg_loss = sum(losses) / len(losses)
-            accelerator.log({f"{split_name}/loss": avg_loss}, step=global_step)
-            accelerator.print(f"[eval] {split_name} loss={avg_loss:.6f}")
+            avg_lcm = sum(lcm_losses) / len(lcm_losses)
+            avg_ffl = sum(ffl_losses) / len(ffl_losses)
+            avg_grad = sum(grad_losses) / len(grad_losses)
+            accelerator.log(
+                {
+                    f"{split_name}/loss": avg_loss,
+                    f"{split_name}/lcm": avg_lcm,
+                    f"{split_name}/ffl": avg_ffl,
+                    f"{split_name}/grad": avg_grad,
+                },
+                step=global_step,
+            )
+            accelerator.print(
+                f"[eval] {split_name} loss={avg_loss:.6f} lcm={avg_lcm:.6f} "
+                f"ffl={avg_ffl:.6f} grad={avg_grad:.6f}"
+            )
         teacher_wrapper.base_model.train()
         student_wrapper.base_model.train()
         accelerator.wait_for_everyone()
@@ -907,7 +973,10 @@ def main():
                     )
                     pred_x0_detached = pred_x0_student.detach()
 
-                    loss = compute_lcm_loss(pred_x0_student, target_x0, loss_type="huber")
+                    text_mask = get_text_mask(batch)
+                    if text_mask is not None:
+                        text_mask = text_mask.to(device, non_blocking=non_blocking)
+                    loss, loss_dict = criterion(pred_x0_student, target_x0, mask=text_mask)
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
@@ -926,6 +995,9 @@ def main():
 
                     if global_step % args.logging_steps == 0 and accelerator.is_local_main_process:
                         loss_val = loss.detach().float().item()
+                        lcm_val = loss_dict["lcm"].detach().float().item()
+                        ffl_val = loss_dict["ffl"].detach().float().item()
+                        grad_val = loss_dict["grad"].detach().float().item()
                         ema_loss = loss_val if ema_loss is None else (0.9 * ema_loss + 0.1 * loss_val)
                         now = time.perf_counter()
                         step_delta = max(global_step - last_log_step, 1)
@@ -964,6 +1036,9 @@ def main():
                             {
                                 "train/loss": loss_val,
                                 "train/loss_ema": ema_loss,
+                                "train/lcm": lcm_val,
+                                "train/ffl": ffl_val,
+                                "train/grad": grad_val,
                                 "train/lr": lr,
                                 "train/it_s": it_s,
                                 "train/epoch": epoch + 1,

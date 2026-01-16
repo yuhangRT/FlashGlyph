@@ -38,6 +38,9 @@ student_model_v2/
   lcm_utils_v2.py            # 时间步采样与 x0 计算
   train_lcm_anytext_v2.py    # 训练脚本
   train_lcm_anytext_v2_2.py  # 训练脚本（优化版）
+  train_lcm_anytext_v2_3.py  # 训练脚本（多域损失版）
+  losses.py                 # FFL + Masked Grad 组合损失
+  train_config_template_v3.yaml  # v3 训练配置模板
   infer_lcm_anytext_v2.py    # 推理脚本（从数据集中取样）
   README.md                  # 使用说明
 ```
@@ -78,10 +81,30 @@ python student_model_v2/train_lcm_anytext_v2_2.py \
 ```
 
 说明：`launch_from_yaml.py` 会读取 YAML 中的 `train.use_optimized`，为 `true` 时调用 `train_lcm_anytext_v2_2.py`。
+也可以在 YAML 中设置 `train_script` 指定训练脚本（如 v3）：
+
+```yaml
+train:
+  train_script: student_model_v2/train_lcm_anytext_v2_3.py
+```
+
+
+## 训练（多域损失 v3：LCM + FFL + Masked Grad）
+
+新增的 v3 脚本引入频域约束与文字区域梯度约束，提升文字边缘与笔画连贯性。
+推荐使用 v3 模板直接启动：
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2 python student_model_v2/oom_guard.py --min-available-gb 4 \
+  accelerate launch --num_processes 2 student_model_v2/launch_from_yaml.py \
+  --config student_model_v2/train_config_template_v3.yaml
+```
+
+v3 模板里通过 `train_script` 指定训练脚本，便于扩展新版本。
 
 ## 训练（从 YAML 配置启动）
 
-使用 `student_model_v2/train_config_template.yaml` 作为模板，在 YAML 里修改参数：
+使用 `student_model_v2/train_config_template.yaml` 或 `student_model_v2/train_config_template_v3.yaml` 作为模板，在 YAML 里修改参数：
 
 ```bash
 accelerate launch --multi_gpu student_model_v2/launch_from_yaml.py \
@@ -116,6 +139,14 @@ train:
 python student_model_v2/oom_guard.py --min-available-gb 8 -- \
   accelerate launch --multi_gpu student_model_v2/launch_from_yaml.py \
   --config student_model_v2/train_config_template.yaml
+```
+
+v3 模板示例：
+
+```bash
+python student_model_v2/oom_guard.py --min-available-gb 8 -- \
+  accelerate launch --multi_gpu student_model_v2/launch_from_yaml.py \
+  --config student_model_v2/train_config_template_v3.yaml
 ```
 
 可用 `--print_args` 查看解析后的 CLI 参数：
@@ -213,3 +244,97 @@ AnyText2 本身很大，Teacher+Student 同时跑会吃显存。可以尝试：
 - 做自由 prompt 的推理 pipeline
 - 引入真正多步一致性蒸馏  
 告诉我即可。
+
+# 版本更替说明
+## v2版本（是对v1的bug修改）
+v2_3是添加了ffl的版本（没有用过，由于baseline效果不好，这个肯定达不到图片清楚文字清晰的效果）  
+虽然能跑通baseline，但是效果很不好。训练结果保存在/checkpoints/train_20260115_090713_v2中。
+核心缺点在于：**代码实现的数学逻辑与 LCM 官方原理存在偏差**，以及**训练配置中的超参数设置失误**。
+
+仔细对比了 LCM-LoRA 官方论文/Demo 代码与你当前使用的 `train_lcm_anytext_v2_2.py`，发现了几处关键差异。正是这些差异导致了模型“只学到了皮毛，没学到灵魂”。
+
+以下是深度分析报告：
+
+---
+
+### 第一部分：核心差异分析（Your Code vs. Official LCM-LoRA）
+
+LCM-LoRA 能发顶刊的核心在于其独特的 Loss 设计和 Solver 逻辑。你的代码在“形”上模仿了，但在“神”上（数学逻辑）有偏差。
+
+#### 差异 1：Target 计算逻辑（最致命的差异）
+
+*   **Official LCM-LoRA (Demo/Paper)**:
+    真正的 LCM 蒸馏使用的是 **Consistency Loss**。
+    Target 不是 Teacher 在当前时刻 $t$ 的预测，而是 **Teacher 模拟 ODE 轨迹走到 $t_{next}$ (或 $t-k$) 后的预测**。
+    $$ \text{Target} = \text{TeacherSolver}(z_t, t, t-k) $$
+    它强迫 Student 在 $t$ 时刻直接预测出 Teacher 在 $t-k$ 时刻的结果。
+
+*   **Your Code (`train_lcm_anytext_v2_2.py`)**:
+    ```python
+    # 代码逻辑简化版
+    noise_pred_teacher = ... # Teacher 预测当前 t 的噪声
+    target_x0 = predict_x0_from_eps(noisy_latents, timesteps, noise_pred_teacher, ...)
+    loss = F.huber_loss(pred_x0_student, target_x0)
+    ```
+    **你的逻辑是“单步 x0 回归”**。你让 Student 去拟合 Teacher 在当前 $t$ 时刻认为的 $x_0$。
+    **后果**：Student 学会了“去噪”，但没学会“加速”。在噪声很大的早期（如 t=900），Teacher 预测的 $x_0$ 本身就是极其模糊、充满噪声的（因为 Teacher 也猜不到最终结果）。Student 拼命去拟合这个模糊的目标，结果就是你看到的**“图形完全看不清，全是伪影”**。
+
+#### 差异 2：Huber Loss 的 Delta 设置
+
+*   **Official LCM**: 通常使用 `F.mse_loss` 或者 `delta` 较小的 Huber Loss。
+*   **Your Code**: `loss = compute_lcm_loss(..., loss_type="huber")` (通常默认 delta=1.0)。
+    对于 Latent Space 的 $x_0$ 预测，数值范围通常在 $[-1, 1]$ 之间。如果 Delta 设得太大，Huber Loss 就退化成了 MSE。这本身问题不大，但在高噪声区间，Student 容易为了平均误差而输出“灰色”图像。
+
+#### 差异 3：CFG Guidance 的“烘焙”方式
+
+*   **Official LCM**: 明确要求 Teacher 使用很大的 Guidance Scale (e.g., $w=8.0$)，并且 Loss 计算是在 $x_0$ 空间进行的。
+*   **Your Code**: 实现了 CFG，这点是做对了。但由于 Target 是单步 $x_0$，Teacher 的 CFG 效果被高噪声掩盖了。
+
+---
+
+### 第二部分：为什么 28500 步效果依然很差？（归因分析）
+
+除了上述算法逻辑差异，你的配置文件中还有两个**“隐形杀手”**：
+
+#### 1. 学习率过高 (Learning Rate Too High)
+*   **你的设置**: `learning_rate: 5e-4`
+*   **标准 LoRA 训练**: 通常是 `1e-4` 或 `5e-5`。
+*   **后果**：LCM 蒸馏对参数非常敏感。`5e-4` 对于 LoRA 来说太大了，会导致权重在最优解附近剧烈震荡，无法收敛到细腻的纹理。这解释了为什么你的图看起来充满了高频噪声和伪影（像过曝的照片）。
+
+#### 2. Batch Size 过小且 Accumulation 策略存疑
+*   **你的设置**: `bs=4`, `accum=2` -> `Effective BS = 8`。
+*   **问题**：对于扩散模型的蒸馏，Batch Size 过小会导致梯度的方差极大。模型一会往左走，一会往右走，很难学到通用的去噪规律。
+*   **建议**：Effective BS 至少要达到 **32** 甚至 **64**。
+
+#### 3. 缺乏“高频约束”
+你之前的尝试中去掉了 FFL 和 Gradient Loss，回到了纯 Huber Loss。
+*   在“单步 x0 回归”的错误逻辑下，Huber Loss 倾向于生成模糊的平均值。
+*   AnyText 的文字部分如果没有额外的边缘约束，在模糊的目标下就会变成一团墨迹。
+
+---
+
+### 第三部分：修正方案（Action Plan）
+
+为了达到 Demo 那样的效果，必须把代码逻辑改回 **真正的 LCM**，并调整超参。
+
+#### 步骤 1：修改 `lcm_utils_v2.py` (引入 Solver 逻辑)
+
+你需要在 `lcm_utils_v2.py` 中实现一个 DDIM Solver Step，用于计算 Teacher 的“下一步”。
+
+```python
+# 在 lcm_utils_v2.py 中添加
+def ddim_step(noise_pred, timesteps, latents, alphas_cumprod, eta=0.0):
+    """
+    模拟 DDIM 往前走一步，计算 z_{t-1} (Next Latent) 而不是 x0
+    """
+    # 1. 获取 alpha_t, alpha_prev
+    # 注意：这里需要处理 timesteps 的索引映射
+    # 简单起见，假设 timesteps 是实际的时间步
+    
+    # ... (需要实现完整的 DDIM update 公式: x_t -> x_t-1) ...
+    # 核心公式: x_prev = sqrt(alpha_prev) * pred_x0 + sqrt(1 - alpha_prev) * pred_epsilon
+    pass
+```
+修正后，写出了v3版本
+
+## v2_4版本（在v2_2上修改核心算法，遵循lcm-lora）

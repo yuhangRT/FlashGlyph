@@ -33,17 +33,27 @@ data:
 train:
   use_optimized: true  # true to use train_lcm_anytext_v2_2.py
   add_time_suffix: true  # create output_dir/train_<time> for each new run (disabled when resuming)
+  train_script: student_model_v2/train_lcm_anytext_v2_3.py
   train_batch_size: 4
   gradient_accumulation_steps: 2
   learning_rate: 5e-4 # 5e-5
+  loss_ffl_weight: 0.05
+  loss_grad_weight: 0.05
+  ffl_alpha: 1.0
+  ffl_patch_factor: 1
+  ffl_ave_spectrum: false
+  ffl_log_matrix: false
+  ffl_batch_matrix: false
+  loss_mask_key: hint  # hint | positions | inv_mask
+  loss_text_weight: 5.0
   lr_scheduler: warmup_cosine  # none | warmup_cosine
   lr_warmup_steps: 500
   lr_min_ratio: 0.0
   max_train_steps: 50000
   max_epochs: 0  # set >0 to use epoch-driven training (overrides max_train_steps)
-  resume_path: student_model_v2/checkpoints/train_20260115_090713/checkpoint-22000  # e.g. student_model_v2/checkpoints/checkpoint-2000
-  resume_optimizer: true
-  resume_add_steps: 0  # 0 uses max_train_steps when resuming
+  resume_path: ""  # e.g. student_model_v2/checkpoints/checkpoint-2000
+  resume_optimizer: false
+  resume_add_steps: 3000  # 0 uses max_train_steps when resuming
   mixed_precision: fp16
   lora_rank: 64
   lora_alpha: 64

@@ -33,11 +33,13 @@ from student_model_v2.dataset_anytext_v2 import (
 )
 from student_model_v2.lcm_utils_v2 import (
     add_noise,
+    append_dims,
     apply_cfg,
     compute_lcm_loss,
     make_lcm_schedule,
-    predict_x0_from_eps,
-    sample_timesteps,
+    predict_x0_from_model_output,
+    sample_timestep_pairs,
+    scalings_for_boundary_conditions,
 )
 
 

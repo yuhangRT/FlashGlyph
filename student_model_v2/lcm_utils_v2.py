@@ -131,3 +131,45 @@ def prepare_conditional_batch(batch, device, non_blocking=False):
     }
 
     return cond_batch, uncond_batch
+
+
+def append_dims(x, target_dims):
+    dims_to_append = target_dims - x.ndim
+    if dims_to_append < 0:
+        raise ValueError(f"input has {x.ndim} dims but target_dims is {target_dims}")
+    return x[(...,) + (None,) * dims_to_append]
+
+
+def scalings_for_boundary_conditions(timesteps, sigma_data=0.5, timestep_scaling=10.0):
+    scaled_t = timesteps.float() * float(timestep_scaling)
+    sigma_data = float(sigma_data)
+    denom = scaled_t ** 2 + sigma_data ** 2
+    c_skip = (sigma_data ** 2) / denom
+    c_out = scaled_t / torch.sqrt(denom)
+    return c_skip, c_out
+
+
+def predict_x0_from_model_output(x_t, t, model_output, alphas_cumprod, parameterization="eps"):
+    if parameterization == "eps":
+        return predict_x0_from_eps(x_t, t, model_output, alphas_cumprod)
+    if parameterization == "x0":
+        return model_output
+    if parameterization == "v":
+        alpha_t = extract_into_tensor(alphas_cumprod, t, x_t.shape)
+        sqrt_alpha = torch.sqrt(alpha_t)
+        sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_t)
+        return sqrt_alpha * x_t - sqrt_one_minus_alpha * model_output
+    raise ValueError(f"Unknown parameterization: {parameterization}")
+
+
+def sample_timestep_pairs(schedule, batch_size, device, step_stride=1):
+    if step_stride < 1:
+        raise ValueError("step_stride must be >= 1")
+    if len(schedule) <= step_stride:
+        raise ValueError("schedule length must be > step_stride")
+    schedule_tensor = torch.tensor(schedule, device=device)
+    max_index = schedule_tensor.shape[0] - step_stride
+    indices = torch.randint(0, max_index, (batch_size,), device=device)
+    t_start = schedule_tensor[indices]
+    t_next = schedule_tensor[indices + step_stride]
+    return t_start, t_next

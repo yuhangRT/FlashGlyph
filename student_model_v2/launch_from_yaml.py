@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,9 @@ def build_args(config):
         "allow_tf32",
         "cudnn_benchmark",
         "resume_optimizer",
+        "ffl_ave_spectrum",
+        "ffl_log_matrix",
+        "ffl_batch_matrix",
     }
 
     for key, value in config.items():
@@ -114,6 +118,22 @@ def prepare_cache(config):
             cache_dir=cache_dir,
         )
 
+def normalize_train_script(entry, repo_root):
+    entry = str(entry).strip()
+    if not entry:
+        return ""
+    if entry.endswith(".py") or "/" in entry or "\\" in entry:
+        path = Path(entry)
+        if not path.is_absolute():
+            path = (repo_root / path).resolve()
+        try:
+            rel = path.relative_to(repo_root)
+        except ValueError:
+            rel = path
+        return ".".join(rel.with_suffix("").parts)
+    return entry
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Launch LCM training from YAML config")
@@ -123,6 +143,7 @@ def main():
     args = parser.parse_args()
 
     cfg = merge_config(load_yaml(args.config))
+    train_script = str(cfg.pop("train_script", "")).strip()
     if args.prepare_cache:
         prepare_cache(cfg)
         return
@@ -140,7 +161,10 @@ def main():
         return
 
     sys.argv = [sys.argv[0]] + cli_args
-    if use_optimized:
+    if train_script:
+        module_name = normalize_train_script(train_script, repo_root)
+        train_main = importlib.import_module(module_name).main
+    elif use_optimized:
         from student_model_v2.train_lcm_anytext_v2_2 import main as train_main
     else:
         from student_model_v2.train_lcm_anytext_v2 import main as train_main
