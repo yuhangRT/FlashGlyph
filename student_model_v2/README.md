@@ -23,11 +23,15 @@
 Teacher 同时跑 Cond + Uncond，再混合；Student 只跑 Cond。  
 这样 Student 学到的结果已经“内化了引导”，推理时不需要 CFG。
 
-3) **目标是 x0 回归（一次 Teacher forward）**  
+3) **v2_2：x0 回归（一次 Teacher forward）**  
 Teacher 只跑一次，得到噪声预测，再按 DDIM 公式换算为 x0 作为监督目标。  
 显存更省，更适合 AnyText2 这种大模型。
 
-4) **时间步只在固定离散点采样**  
+4) **v2_4：轨迹一致性（贴近官方 LCM）**  
+Teacher 在更高噪声步预测并通过 DDIM 推进到下一步；Student 学习一致性目标（带边界缩放）。  
+效果更稳，但显存/算力开销更高。
+
+5) **时间步只在固定离散点采样**  
 这符合 LCM 训练逻辑：让 Student 精准学习少数关键步骤。
 
 ## 目录结构
@@ -39,8 +43,10 @@ student_model_v2/
   train_lcm_anytext_v2.py    # 训练脚本
   train_lcm_anytext_v2_2.py  # 训练脚本（优化版）
   train_lcm_anytext_v2_3.py  # 训练脚本（多域损失版）
+  train_lcm_anytext_v2_4.py  # 训练脚本（轨迹一致性版）
   losses.py                 # FFL + Masked Grad 组合损失
   train_config_template_v3.yaml  # v3 训练配置模板
+  train_config_template_v4.yaml  # v4 训练配置模板
   infer_lcm_anytext_v2.py    # 推理脚本（从数据集中取样）
   README.md                  # 使用说明
 ```
@@ -88,6 +94,19 @@ train:
   train_script: student_model_v2/train_lcm_anytext_v2_3.py
 ```
 
+## 训练（v2.4 轨迹一致性，贴近官方 LCM）
+
+v2.4 使用 Teacher 轨迹推进 + 边界缩放的一致性目标，训练更稳但显存更高。
+推荐直接使用 v4 模板启动：
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2 python student_model_v2/oom_guard.py --min-available-gb 4 \
+  accelerate launch --num_processes 2 student_model_v2/launch_from_yaml.py \
+  --config student_model_v2/train_config_template_v4.yaml
+```
+
+可调参数：`w_min/w_max`（随机 CFG）、`lcm_step`（步长）、`target_from_teacher`（更严格但更耗显存）。
+
 
 ## 训练（多域损失 v3：LCM + FFL + Masked Grad）
 
@@ -104,7 +123,7 @@ v3 模板里通过 `train_script` 指定训练脚本，便于扩展新版本。
 
 ## 训练（从 YAML 配置启动）
 
-使用 `student_model_v2/train_config_template.yaml` 或 `student_model_v2/train_config_template_v3.yaml` 作为模板，在 YAML 里修改参数：
+使用 `student_model_v2/train_config_template.yaml`、`student_model_v2/train_config_template_v3.yaml` 或 `student_model_v2/train_config_template_v4.yaml` 作为模板，在 YAML 里修改参数：
 
 ```bash
 accelerate launch --multi_gpu student_model_v2/launch_from_yaml.py \
@@ -147,6 +166,14 @@ v3 模板示例：
 python student_model_v2/oom_guard.py --min-available-gb 8 -- \
   accelerate launch --multi_gpu student_model_v2/launch_from_yaml.py \
   --config student_model_v2/train_config_template_v3.yaml
+```
+
+v4 模板示例：
+
+```bash
+python student_model_v2/oom_guard.py --min-available-gb 8 -- \
+  accelerate launch --multi_gpu student_model_v2/launch_from_yaml.py \
+  --config student_model_v2/train_config_template_v4.yaml
 ```
 
 可用 `--print_args` 查看解析后的 CLI 参数：

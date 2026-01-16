@@ -36,7 +36,9 @@ from student_model_v2.lcm_utils_v2 import (
     append_dims,
     apply_cfg,
     compute_lcm_loss,
+    ddim_step,
     make_lcm_schedule,
+    predict_eps_from_model_output,
     predict_x0_from_model_output,
     sample_timestep_pairs,
     scalings_for_boundary_conditions,
@@ -410,7 +412,7 @@ def warmup_cosine_scale(step, total_steps, warmup_steps, min_ratio):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LCM-LoRA distillation for AnyText2 (v2)")
+    parser = argparse.ArgumentParser(description="LCM-LoRA distillation for AnyText2 (v2.4)")
     parser.add_argument("--config", type=str, default="models_yaml/anytext2_sd15.yaml")
     parser.add_argument("--teacher_ckpt", type=str, default="models/anytext_v2.0.ckpt")
     parser.add_argument("--output_dir", type=str, default="student_model_v2/checkpoints")
@@ -444,6 +446,17 @@ def main():
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--cfg_scale", type=float, default=7.5)
+    parser.add_argument("--w_min", type=float, default=None, help="Min guidance scale for teacher CFG sampling.")
+    parser.add_argument("--w_max", type=float, default=None, help="Max guidance scale for teacher CFG sampling.")
+    parser.add_argument("--lcm_step", type=int, default=1, help="Step stride on inference schedule for LCM target.")
+    parser.add_argument("--sigma_data", type=float, default=0.5, help="Sigma_data for LCM boundary scaling.")
+    parser.add_argument("--timestep_scaling", type=float, default=10.0, help="Timestep scaling for boundary scaling.")
+    parser.add_argument(
+        "--target_from_teacher",
+        action="store_true",
+        default=False,
+        help="Use teacher at t_prev for target (extra compute, closer to full teacher target).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=2000)
@@ -475,6 +488,17 @@ def main():
     parser.add_argument("--cache_dir", type=str, default="")
     parser.add_argument("--auto_list_path", type=str, default="")
     args = parser.parse_args()
+
+    if args.w_min is None:
+        args.w_min = float(args.cfg_scale)
+    if args.w_max is None:
+        args.w_max = float(args.cfg_scale)
+    if args.w_min > args.w_max:
+        raise ValueError("w_min must be <= w_max")
+    if args.lcm_step < 1:
+        raise ValueError("lcm_step must be >= 1")
+    if args.timestep_scaling <= 0:
+        raise ValueError("timestep_scaling must be > 0")
 
     if args.worker_num_threads and args.worker_num_threads > 0:
         os.environ.setdefault("OMP_NUM_THREADS", str(args.worker_num_threads))
@@ -690,6 +714,13 @@ def main():
 
     alphas_cumprod = teacher_wrapper.base_model.alphas_cumprod.to(device)
     schedule = make_lcm_schedule(args.num_inference_steps, num_train_timesteps=alphas_cumprod.shape[0])
+    if len(schedule) <= args.lcm_step:
+        raise ValueError("num_inference_steps must be > lcm_step")
+    parameterization = getattr(teacher_wrapper.base_model, "parameterization", "eps")
+    w_min = float(args.w_min)
+    w_max = float(args.w_max)
+    sigma_data = float(args.sigma_data)
+    timestep_scaling = float(args.timestep_scaling)
     autocast_context = accelerator.autocast if hasattr(accelerator, "autocast") else nullcontext
     steps_per_epoch = max(1, math.ceil(len(train_loader) / args.gradient_accumulation_steps))
     if args.max_epochs > 0:
@@ -735,9 +766,11 @@ def main():
                     latents = encode_img_and_masked_x(
                         batch, teacher_wrapper, device, non_blocking=non_blocking
                     )
-                    timesteps = sample_timesteps(schedule, batch_size, device)
                     noise = torch.randn_like(latents)
-                    noisy_latents = add_noise(latents, noise, timesteps, alphas_cumprod)
+                    start_timesteps, timesteps = sample_timestep_pairs(
+                        schedule, batch_size, device, step_stride=args.lcm_step
+                    )
+                    noisy_latents = add_noise(latents, noise, start_timesteps, alphas_cumprod)
 
                     cond_batch = build_cond_batch(batch, device, non_blocking=non_blocking)
                     uncond_batch, uncond_text_info, uncond_text_emb = uncond_cache.get(
@@ -746,26 +779,58 @@ def main():
                     cond_text_info = teacher_wrapper.prepare_text_info(cond_batch)
                     cond_text_emb = teacher_wrapper.encode_text(cond_batch, cond_text_info)
 
+                    w = torch.rand(batch_size, device=device) * (w_max - w_min) + w_min
+                    w = w.view(batch_size, 1, 1, 1).to(noisy_latents.dtype)
+
                     noise_pred_cond = teacher_wrapper.forward(
-                        noisy_latents, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                        noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
                     )
                     noise_pred_uncond = teacher_wrapper.forward(
-                        noisy_latents, timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
+                        noisy_latents, start_timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
                     )
-                    noise_pred_teacher = apply_cfg(noise_pred_cond, noise_pred_uncond, args.cfg_scale)
-                    target_x0 = predict_x0_from_eps(
-                        noisy_latents, timesteps, noise_pred_teacher, alphas_cumprod
+                    noise_pred_teacher = apply_cfg(noise_pred_cond, noise_pred_uncond, w)
+                    eps_teacher = predict_eps_from_model_output(
+                        noisy_latents, start_timesteps, noise_pred_teacher, alphas_cumprod, parameterization
                     )
+                    x_prev = ddim_step(noisy_latents, start_timesteps, timesteps, eps_teacher, alphas_cumprod)
 
-                    student_text_info = student_wrapper.prepare_text_info(cond_batch)
-                    student_text_emb = student_wrapper.encode_text(cond_batch, student_text_info)
+                    if args.target_from_teacher:
+                        target_cond = teacher_wrapper.forward(
+                            x_prev, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                        )
+                        target_uncond = teacher_wrapper.forward(
+                            x_prev, timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
+                        )
+                        target_noise_pred = apply_cfg(target_cond, target_uncond, w)
+                    else:
+                        target_noise_pred = student_wrapper.forward(
+                            x_prev, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                        )
+
+                    pred_x0_target = predict_x0_from_model_output(
+                        x_prev, timesteps, target_noise_pred, alphas_cumprod, parameterization
+                    )
+                    c_skip, c_out = scalings_for_boundary_conditions(
+                        timesteps, sigma_data=sigma_data, timestep_scaling=timestep_scaling
+                    )
+                    c_skip = append_dims(c_skip, x_prev.ndim)
+                    c_out = append_dims(c_out, x_prev.ndim)
+                    target = c_skip * x_prev + c_out * pred_x0_target
+
                     noise_pred_student = student_wrapper.forward(
-                        noisy_latents, timesteps, student_text_emb, student_text_info, cond_batch["hint"]
+                        noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
                     )
-                    pred_x0_student = predict_x0_from_eps(
-                        noisy_latents, timesteps, noise_pred_student, alphas_cumprod
+                    pred_x0_student = predict_x0_from_model_output(
+                        noisy_latents, start_timesteps, noise_pred_student, alphas_cumprod, parameterization
                     )
-                    loss = compute_lcm_loss(pred_x0_student, target_x0, loss_type="huber")
+                    c_skip_start, c_out_start = scalings_for_boundary_conditions(
+                        start_timesteps, sigma_data=sigma_data, timestep_scaling=timestep_scaling
+                    )
+                    c_skip_start = append_dims(c_skip_start, noisy_latents.ndim)
+                    c_out_start = append_dims(c_out_start, noisy_latents.ndim)
+                    model_pred = c_skip_start * noisy_latents + c_out_start * pred_x0_student
+
+                    loss = compute_lcm_loss(model_pred, target, loss_type="huber")
                 losses.append(loss.detach().float().item())
 
         if losses and accelerator.is_local_main_process:
@@ -875,9 +940,11 @@ def main():
                     latents = latents.detach().clone()
                     batch["masked_x"] = batch["masked_x"].detach().clone()
 
-                    timesteps = sample_timesteps(schedule, batch_size, device)
                     noise = torch.randn_like(latents)
-                    noisy_latents = add_noise(latents, noise, timesteps, alphas_cumprod)
+                    start_timesteps, timesteps = sample_timestep_pairs(
+                        schedule, batch_size, device, step_stride=args.lcm_step
+                    )
+                    noisy_latents = add_noise(latents, noise, start_timesteps, alphas_cumprod)
 
                     cond_batch = build_cond_batch(batch, device, non_blocking=non_blocking)
                     with torch.inference_mode():
@@ -887,29 +954,60 @@ def main():
                         cond_text_info = teacher_wrapper.prepare_text_info(cond_batch)
                         cond_text_emb = teacher_wrapper.encode_text(cond_batch, cond_text_info)
 
+                        w = torch.rand(batch_size, device=device) * (w_max - w_min) + w_min
+                        w = w.view(batch_size, 1, 1, 1).to(noisy_latents.dtype)
+
                         noise_pred_cond = teacher_wrapper.forward(
-                            noisy_latents, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                            noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
                         )
                         noise_pred_uncond = teacher_wrapper.forward(
-                            noisy_latents, timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
+                            noisy_latents, start_timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
                         )
-                        noise_pred_teacher = apply_cfg(noise_pred_cond, noise_pred_uncond, args.cfg_scale)
-                        target_x0 = predict_x0_from_eps(
-                            noisy_latents, timesteps, noise_pred_teacher, alphas_cumprod
+                        noise_pred_teacher = apply_cfg(noise_pred_cond, noise_pred_uncond, w)
+                        eps_teacher = predict_eps_from_model_output(
+                            noisy_latents, start_timesteps, noise_pred_teacher, alphas_cumprod, parameterization
                         )
-                    target_x0 = target_x0.detach().clone()
+                        x_prev = ddim_step(noisy_latents, start_timesteps, timesteps, eps_teacher, alphas_cumprod)
 
-                    student_text_info = student_wrapper.prepare_text_info(cond_batch)
-                    student_text_emb = student_wrapper.encode_text(cond_batch, student_text_info)
+                        if args.target_from_teacher:
+                            target_cond = teacher_wrapper.forward(
+                                x_prev, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                            )
+                            target_uncond = teacher_wrapper.forward(
+                                x_prev, timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
+                            )
+                            target_noise_pred = apply_cfg(target_cond, target_uncond, w)
+                        else:
+                            target_noise_pred = student_wrapper.forward(
+                                x_prev, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                            )
+
+                        pred_x0_target = predict_x0_from_model_output(
+                            x_prev, timesteps, target_noise_pred, alphas_cumprod, parameterization
+                        )
+                        c_skip, c_out = scalings_for_boundary_conditions(
+                            timesteps, sigma_data=sigma_data, timestep_scaling=timestep_scaling
+                        )
+                        c_skip = append_dims(c_skip, x_prev.ndim)
+                        c_out = append_dims(c_out, x_prev.ndim)
+                        target = c_skip * x_prev + c_out * pred_x0_target
+
                     noise_pred_student = student_wrapper.forward(
-                        noisy_latents, timesteps, student_text_emb, student_text_info, cond_batch["hint"]
+                        noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
                     )
-                    pred_x0_student = predict_x0_from_eps(
-                        noisy_latents, timesteps, noise_pred_student, alphas_cumprod
+                    pred_x0_student = predict_x0_from_model_output(
+                        noisy_latents, start_timesteps, noise_pred_student, alphas_cumprod, parameterization
                     )
                     pred_x0_detached = pred_x0_student.detach()
 
-                    loss = compute_lcm_loss(pred_x0_student, target_x0, loss_type="huber")
+                    c_skip_start, c_out_start = scalings_for_boundary_conditions(
+                        start_timesteps, sigma_data=sigma_data, timestep_scaling=timestep_scaling
+                    )
+                    c_skip_start = append_dims(c_skip_start, noisy_latents.ndim)
+                    c_out_start = append_dims(c_out_start, noisy_latents.ndim)
+                    model_pred = c_skip_start * noisy_latents + c_out_start * pred_x0_student
+
+                    loss = compute_lcm_loss(model_pred, target, loss_type="huber")
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:

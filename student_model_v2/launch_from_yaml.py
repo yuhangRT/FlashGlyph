@@ -49,6 +49,7 @@ def build_args(config):
         "ffl_ave_spectrum",
         "ffl_log_matrix",
         "ffl_batch_matrix",
+        "target_from_teacher",
     }
 
     for key, value in config.items():

@@ -141,6 +141,7 @@ def append_dims(x, target_dims):
 
 
 def scalings_for_boundary_conditions(timesteps, sigma_data=0.5, timestep_scaling=10.0):
+    # Match diffusers LCMScheduler boundary scaling (timestep / 0.1 -> timestep * 10).
     scaled_t = timesteps.float() * float(timestep_scaling)
     sigma_data = float(sigma_data)
     denom = scaled_t ** 2 + sigma_data ** 2
@@ -159,6 +160,19 @@ def predict_x0_from_model_output(x_t, t, model_output, alphas_cumprod, parameter
         sqrt_alpha = torch.sqrt(alpha_t)
         sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_t)
         return sqrt_alpha * x_t - sqrt_one_minus_alpha * model_output
+    raise ValueError(f"Unknown parameterization: {parameterization}")
+
+
+def predict_eps_from_model_output(x_t, t, model_output, alphas_cumprod, parameterization="eps"):
+    if parameterization == "eps":
+        return model_output
+    alpha_t = extract_into_tensor(alphas_cumprod, t, x_t.shape)
+    sqrt_alpha = torch.sqrt(alpha_t)
+    sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_t)
+    if parameterization == "x0":
+        return (x_t - sqrt_alpha * model_output) / sqrt_one_minus_alpha
+    if parameterization == "v":
+        return sqrt_alpha * model_output + sqrt_one_minus_alpha * x_t
     raise ValueError(f"Unknown parameterization: {parameterization}")
 
 
