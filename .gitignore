@@ -1,6 +1,7 @@
 .idea/
 .DS_Store
 .claude
+.tmp_focal_frequency_loss
 
 training/
 lightning_logs/
