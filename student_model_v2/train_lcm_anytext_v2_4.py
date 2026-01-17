@@ -521,6 +521,7 @@ def main():
     parser.add_argument("--teacher_ckpt", type=str, default="models/anytext_v2.0.ckpt")
     parser.add_argument("--output_dir", type=str, default="student_model_v2/checkpoints")
     parser.add_argument("--dataset_json", type=str, nargs="+", default=["demodataset/annotations/demo_data.json"])
+    parser.add_argument("--lmdb_path", type=str, default="", help="Optional LMDB cache path for dataset.")
     parser.add_argument("--use_mock_dataset", action="store_true")
     parser.add_argument("--resume_path", type=str, default="")
     parser.add_argument("--resume_optimizer", action="store_true", default=False)
@@ -741,6 +742,7 @@ def main():
                 streaming=args.streaming,
                 streaming_threshold_mb=args.streaming_threshold_mb,
                 cache_dir=cache_dir or None,
+                lmdb_path=args.lmdb_path or None,
             )
             for path in json_paths
         ]

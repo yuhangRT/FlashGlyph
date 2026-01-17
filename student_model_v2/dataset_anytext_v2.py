@@ -1,3 +1,4 @@
+import io
 import json
 import math
 import mmap
@@ -30,6 +31,8 @@ except Exception:
 STREAMING_THRESHOLD_MB = 200
 _INDEX_STRUCT = struct.Struct("Q")
 _INDEX_ITEM_SIZE = _INDEX_STRUCT.size
+LMDB_META_KEY = b"__meta__"
+LMDB_META_VERSION = 1
 _FONT_CACHE = {}
 _FONT_CACHE_MAX = 100
 
@@ -89,6 +92,89 @@ def _add_suffix(path, suffix):
 def _meta_path_for(path):
     path = Path(path)
     return path.with_name(path.stem + ".meta.json")
+
+
+def _make_lmdb_key(json_path, img_name):
+    base = f"{Path(json_path).resolve()}::{img_name}"
+    return sha1(base.encode("utf-8")).hexdigest().encode("ascii")
+
+
+def _read_lmdb_meta(lmdb_path):
+    try:
+        import lmdb  # type: ignore
+    except Exception:
+        return None, "lmdb not installed"
+    lmdb_path = str(lmdb_path)
+    if not os.path.exists(lmdb_path):
+        return None, "lmdb path not found"
+    env = lmdb.open(
+        lmdb_path,
+        readonly=True,
+        lock=False,
+        readahead=False,
+        max_readers=8,
+        subdir=True,
+    )
+    with env.begin(write=False) as txn:
+        raw = txn.get(LMDB_META_KEY)
+    env.close()
+    if not raw:
+        return None, "lmdb meta missing"
+    try:
+        return json.loads(raw.decode("utf-8")), None
+    except Exception:
+        return None, "lmdb meta invalid"
+
+
+def _build_font_hint_mask(polygon, height, width, target_area_range):
+    if target_area_range[0] >= 1.0 and target_area_range[1] >= 1.0:
+        return None
+    polygon = np.array(polygon, dtype=np.float32)
+    polygon[:, 0] = np.clip(polygon[:, 0], 0, width - 1)
+    polygon[:, 1] = np.clip(polygon[:, 1], 0, height - 1)
+    pts = polygon.reshape((-1, 1, 2)).astype(np.int32)
+    rect = cv2.minAreaRect(pts)
+    center, size, angle = rect
+    rect_width, rect_height = size
+    long_side, short_side = max(rect_width, rect_height), min(rect_width, rect_height)
+    if long_side <= 0:
+        return None
+    area_ratio = random.uniform(target_area_range[0], target_area_range[1])
+    long_axis_mask_length = long_side * (1 - area_ratio)
+    if long_axis_mask_length <= 0:
+        return None
+    angle_rad = np.radians(angle)
+    rect_vector = np.array([np.cos(angle_rad), np.sin(angle_rad)])
+    if rect_width < rect_height:
+        rect_vector = np.array([-rect_vector[1], rect_vector[0]])
+    start_offset = random.uniform(0, max(long_side - long_axis_mask_length, 0))
+    start_point = center - rect_vector * (long_side / 2 - start_offset)
+    mask_center = start_point + rect_vector * (long_axis_mask_length / 2)
+    mask_vector = rect_vector * (long_axis_mask_length / 2)
+    short_axis_vector = np.array([-rect_vector[1], rect_vector[0]]) * (short_side / 2)
+    mask_corners = np.array(
+        [
+            mask_center - mask_vector - short_axis_vector,
+            mask_center + mask_vector - short_axis_vector,
+            mask_center + mask_vector + short_axis_vector,
+            mask_center - mask_vector + short_axis_vector,
+        ],
+        dtype=np.int32,
+    )
+    mask = np.ones((height, width), dtype=np.float32)
+    cv2.fillPoly(mask, [mask_corners], color=0)
+    return mask
+
+
+def apply_font_hint_base(font_hint_base, polygon, target_area_range, prob=1.0):
+    if random.random() < (1 - prob):
+        return np.zeros_like(font_hint_base)
+    mask = _build_font_hint_mask(polygon, font_hint_base.shape[0], font_hint_base.shape[1], target_area_range)
+    if mask is None:
+        return font_hint_base
+    if mask.ndim == 2 and font_hint_base.ndim == 3:
+        mask = mask[..., None]
+    return font_hint_base * mask
 
 
 class IndexFile:
@@ -785,12 +871,16 @@ class RealAnyTextDataset(Dataset):
         streaming=True,
         streaming_threshold_mb=STREAMING_THRESHOLD_MB,
         cache_dir=None,
+        lmdb_path=None,
     ):
         self.data = None
-        self.json_path = json_path
+        json_path_obj = Path(json_path)
+        if not json_path_obj.is_absolute():
+            json_path_obj = (Path(__file__).resolve().parent.parent / json_path_obj).resolve()
+        self.json_path = str(json_path_obj)
         if streaming:
             index = JsonlIndex(
-                json_path=json_path,
+                json_path=self.json_path,
                 wm_thresh=wm_thresh,
                 force_streaming=True,
                 threshold_mb=streaming_threshold_mb,
@@ -799,10 +889,10 @@ class RealAnyTextDataset(Dataset):
             self.data_root = index.data_root
             self.data_list = index
         else:
-            self.data = load(json_path)
+            self.data = load(self.json_path)
             self.data_root = self.data["data_root"]
             self.data_list = [d for d in self.data["data_list"] if d.get("wm_score", 0) < wm_thresh]
-        self.data_roots = _infer_data_roots(self.data_root, json_path=json_path)
+        self.data_roots = _infer_data_roots(self.data_root, json_path=self.json_path)
         if self.data_roots:
             self.data_root = self.data_roots[0]
 
@@ -819,6 +909,35 @@ class RealAnyTextDataset(Dataset):
         self.mask_img_prob = mask_img_prob
         self.fix_masked_img_bug = fix_masked_img_bug
 
+        self.lmdb_path = lmdb_path or ""
+        if self.lmdb_path:
+            lmdb_path_obj = Path(self.lmdb_path)
+            if not lmdb_path_obj.is_absolute():
+                lmdb_path_obj = (Path(__file__).resolve().parent.parent / lmdb_path_obj).resolve()
+            self.lmdb_path = str(lmdb_path_obj)
+        self._lmdb_env = None
+        self._lmdb_pid = None
+        self._lmdb_enabled = False
+        self._lmdb_use_font_hint = False
+        if self.lmdb_path:
+            meta, err = _read_lmdb_meta(self.lmdb_path)
+            if meta is None:
+                print(f"[lmdb] disabled for {self.json_path}: {err}")
+            else:
+                expected_font = str(Path(self.font_path).resolve())
+                if (
+                    int(meta.get("version", -1)) == LMDB_META_VERSION
+                    and int(meta.get("resolution", -1)) == int(self.resolution)
+                    and int(meta.get("max_chars", -1)) == int(self.max_chars)
+                    and str(meta.get("font_path", "")) == expected_font
+                    and float(meta.get("glyph_scale", -1)) == float(self.glyph_scale)
+                    and int(meta.get("vert_ang", -1)) == 10
+                ):
+                    self._lmdb_enabled = True
+                    self._lmdb_use_font_hint = not self.font_hint_randaug
+                else:
+                    print(f"[lmdb] meta mismatch for {self.json_path}; disabled.")
+
     def __len__(self):
         return len(self.data_list)
 
@@ -830,6 +949,39 @@ class RealAnyTextDataset(Dataset):
                     return candidate
             return None
         return os.path.join(self.data_root, img_name)
+
+    def _get_lmdb_env(self):
+        if not self._lmdb_enabled:
+            return None
+        pid = os.getpid()
+        if self._lmdb_env is None or self._lmdb_pid != pid:
+            import lmdb  # type: ignore
+
+            self._lmdb_env = lmdb.open(
+                self.lmdb_path,
+                readonly=True,
+                lock=False,
+                readahead=False,
+                max_readers=512,
+                subdir=True,
+            )
+            self._lmdb_pid = pid
+        return self._lmdb_env
+
+    def _load_lmdb_item(self, img_name):
+        env = self._get_lmdb_env()
+        if env is None:
+            return None
+        key = _make_lmdb_key(self.json_path, img_name)
+        with env.begin(write=False) as txn:
+            raw = txn.get(key)
+        if not raw:
+            return None
+        try:
+            with np.load(io.BytesIO(raw), allow_pickle=False) as data:
+                return {k: data[k] for k in data.files}
+        except Exception:
+            return None
 
     def __getitem__(self, idx):
         item_dict = {}
@@ -844,6 +996,10 @@ class RealAnyTextDataset(Dataset):
                     break
         if img_path is None:
             raise FileNotFoundError(f"Image not found for {cur_item.get('img_name')}")
+
+        lmdb_item = None
+        if self._lmdb_enabled:
+            lmdb_item = self._load_lmdb_item(cur_item.get("img_name"))
 
         img = Image.open(img_path).convert("RGB")
         if img.size != (self.resolution, self.resolution):
@@ -876,11 +1032,13 @@ class RealAnyTextDataset(Dataset):
         languages = []
 
         invalid_polygons = []
+        valid_sel_indices = []
         for i in sel_idxs:
             ann = annotations[i]
             if ann.get("valid", True) is False:
                 invalid_polygons.append(np.array(ann["polygon"]))
                 continue
+            valid_sel_indices.append(i)
             polygons.append(np.array(ann["polygon"]))
             texts.append(ann["text"][: self.max_chars])
             lang = ann.get("language", "Latin")
@@ -911,9 +1069,26 @@ class RealAnyTextDataset(Dataset):
         n_lines = len(texts)
         item_dict["text_caption"] = build_text_caption(n_lines)
 
+        glyphs_np = lmdb_item.get("glyphs") if lmdb_item else None
+        gly_line_np = lmdb_item.get("gly_line") if lmdb_item else None
+        font_hint_base_np = lmdb_item.get("font_hint_base") if lmdb_item else None
+
         glyphs = []
         gly_line = []
         for idx, text in enumerate(texts):
+            ann_idx = valid_sel_indices[idx] if idx < len(valid_sel_indices) else None
+            if (
+                ann_idx is not None
+                and glyphs_np is not None
+                and gly_line_np is not None
+                and ann_idx < glyphs_np.shape[0]
+                and ann_idx < gly_line_np.shape[0]
+            ):
+                glyph = torch.from_numpy(glyphs_np[ann_idx]).float() / 255.0
+                gly_line_item = torch.from_numpy(gly_line_np[ann_idx]).float() / 255.0
+                gly_line.append(gly_line_item)
+                glyphs.append(glyph)
+                continue
             gly_line.append(draw_glyph(self.font, text))
             glyph_color = (colors[idx] * 255).astype(np.uint8)
             glyphs.append(
@@ -937,14 +1112,28 @@ class RealAnyTextDataset(Dataset):
 
         font_hint_list = []
         if self.font_hint_prob > 0:
-            for polygon in polygons:
-                font_hint, _ = draw_font_hint(
-                    img,
-                    polygon,
-                    target_area_range=self.font_hint_area,
-                    prob=self.font_hint_prob,
-                    randaug=self.font_hint_randaug,
-                )
+            for idx, polygon in enumerate(polygons):
+                ann_idx = valid_sel_indices[idx] if idx < len(valid_sel_indices) else None
+                if (
+                    ann_idx is not None
+                    and self._lmdb_use_font_hint
+                    and font_hint_base_np is not None
+                    and ann_idx < font_hint_base_np.shape[0]
+                ):
+                    base = font_hint_base_np[ann_idx].astype(np.float32) / 255.0
+                    if base.ndim == 2:
+                        base = base[..., None]
+                    font_hint = apply_font_hint_base(
+                        base, polygon, target_area_range=self.font_hint_area, prob=self.font_hint_prob
+                    )
+                else:
+                    font_hint, _ = draw_font_hint(
+                        img,
+                        polygon,
+                        target_area_range=self.font_hint_area,
+                        prob=self.font_hint_prob,
+                        randaug=self.font_hint_randaug,
+                    )
                 font_hint_list.append(torch.from_numpy(font_hint).permute(2, 0, 1).float())
         else:
             for _ in polygons:

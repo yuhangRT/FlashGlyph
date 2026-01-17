@@ -8,6 +8,7 @@ model:
 data:
   cache_dir: dataset_cache/anytext2
   auto_list_path: dataset_cache/anytext2/train_paths.list
+  lmdb_path: dataset_cache/anytext2_lmdb  # optional LMDB cache (see README)
   # 使用小数据集进行测试
   dataset_json:
     # - demodataset/annotations/demo_data.json
@@ -42,7 +43,7 @@ train:
   lcm_step: 1
   sigma_data: 0.5
   timestep_scaling: 10.0
-  target_from_teacher: true
+  target_from_teacher: false
   lr_scheduler: warmup_cosine  # none | warmup_cosine
   lr_warmup_steps: 500
   lr_min_ratio: 0.0

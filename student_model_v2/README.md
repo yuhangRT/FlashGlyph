@@ -107,6 +107,35 @@ CUDA_VISIBLE_DEVICES=1,2 python student_model_v2/oom_guard.py --min-available-gb
 
 可调参数：`w_min/w_max`（随机 CFG）、`lcm_step`（步长）、`target_from_teacher`（更严格但更耗显存）、`log_image_infer_steps`（预览推理步数）。
 
+## 离线 LMDB 缓存（可选，加速数据管线）
+
+用于缓存 `glyphs/gly_line/font_hint_base` 等重 CPU 特征，训练时只做轻量随机化。
+
+构建 LMDB：
+
+```bash
+python student_model_v2/build_lmdb_cache.py \
+  --dataset_json dataset/anytext2_json_files/anytext2_json_files/ocr_data/Art/data_v1.2b.json \
+  --output_lmdb dataset_cache/anytext2_lmdb \
+  --resolution 512 \
+  --max_chars 20 \
+  --font_path ./font/Arial_Unicode.ttf \
+  --num_workers 4 \
+  --map_size_gb 256
+```
+
+启用 LMDB（YAML `data` 段）：
+
+```yaml
+data:
+  lmdb_path: dataset_cache/anytext2_lmdb
+```
+
+注意事项：
+1) LMDB 的 `meta` 必须匹配 `resolution/max_chars/font_path/glyph_scale/vert_ang`  
+2) `font_hint_randaug=true` 时会回退在线计算（不使用缓存 font_hint）  
+3) 建议 `num_workers=4~6`，避免 64G 内存压力
+
 
 ## 训练（多域损失 v3：LCM + FFL + Masked Grad）
 
