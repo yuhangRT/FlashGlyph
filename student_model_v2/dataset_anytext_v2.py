@@ -407,13 +407,21 @@ def draw_glyph2(font, text, polygon, color, scale=1.0, width=512, height=512, ad
         new_font = _get_font_variant(font, int(optimal_font_size))
 
         if add_space and not vert:
-            for i in range(1, 100):
-                text_space = _insert_spaces(text, i)
+            max_spaces = 50
+            lo, hi = 1, max_spaces
+            best = 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                text_space = _insert_spaces(text, mid)
                 bbox2 = draw.textbbox((0, 0), text=text_space, font=new_font)
                 text_w, text_h = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
-                if text_w > max_dim or text_h > min_dim:
-                    text = _insert_spaces(text, i - 1)
-                    break
+                if text_w <= max_dim and text_h <= min_dim:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best > 0:
+                text = _insert_spaces(text, best)
 
         left, top, right, bottom = draw.textbbox((0, 0), text=text, font=new_font)
         text_width = right - left

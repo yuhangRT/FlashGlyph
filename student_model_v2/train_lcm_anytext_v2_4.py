@@ -284,6 +284,24 @@ class UncondCache:
         return cached
 
 
+def get_cond_cache(batch, wrapper, device, non_blocking=False):
+    cache = batch.get("_cond_cache")
+    wrapper_id = id(wrapper.base_model)
+    if cache and cache.get("wrapper_id") == wrapper_id:
+        return cache["hint"], cache["text_info"], cache["text_emb"]
+    cond_batch = build_cond_batch(batch, device, non_blocking=non_blocking)
+    text_info = wrapper.prepare_text_info(cond_batch)
+    text_emb = wrapper.encode_text(cond_batch, text_info)
+    cache = {
+        "wrapper_id": wrapper_id,
+        "hint": cond_batch["hint"],
+        "text_info": text_info,
+        "text_emb": text_emb,
+    }
+    batch["_cond_cache"] = cache
+    return cache["hint"], cache["text_info"], cache["text_emb"]
+
+
 def encode_img_and_masked_x(batch, wrapper, device, non_blocking=False):
     img = batch["img"]
     masked_img = batch.get("masked_img", img)
@@ -310,6 +328,32 @@ def _ensure_nchw(tensor):
         if tensor.shape[-1] in (1, 3):
             return tensor.permute(0, 3, 1, 2)
     return tensor
+
+
+def _slice_batch_for_log(batch, max_samples):
+    if max_samples <= 0:
+        return batch
+    if not batch or "img" not in batch:
+        return batch
+    if batch["img"].shape[0] <= max_samples:
+        return batch
+
+    sliced = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            sliced[key] = value[:max_samples]
+        elif isinstance(value, list):
+            if not value:
+                sliced[key] = value
+            elif torch.is_tensor(value[0]):
+                sliced[key] = [v[:max_samples] for v in value]
+            elif isinstance(value[0], (list, tuple)):
+                sliced[key] = [list(v[:max_samples]) for v in value]
+            else:
+                sliced[key] = value[:max_samples]
+        else:
+            sliced[key] = value
+    return sliced
 
 
 def _expand_to_rgb(tensor):
@@ -356,6 +400,66 @@ def log_train_images(step, batch, pred_x0_student, wrapper, output_dir, max_samp
     out_path = out_dir / f"step_{step:07d}.png"
     torchvision.utils.save_image(grid, out_path)
     return str(out_path)
+
+
+def log_train_images_infer(
+    step,
+    batch,
+    wrapper,
+    output_dir,
+    max_samples,
+    num_inference_steps,
+    alphas_cumprod,
+    parameterization,
+    device,
+    autocast_context,
+    non_blocking=False,
+):
+    if max_samples <= 0:
+        return None
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    batch = _slice_batch_for_log(batch, max_samples)
+    was_training = wrapper.base_model.training
+    wrapper.base_model.eval()
+    try:
+        with torch.no_grad():
+            with autocast_context():
+                hint, text_info, text_emb = get_cond_cache(
+                    batch, wrapper, device, non_blocking=non_blocking
+                )
+                batch_size = hint.shape[0]
+                latent_shape = batch["masked_x"].shape[1:]
+                dtype = next(wrapper.base_model.parameters()).dtype
+
+                latents = torch.randn((batch_size, *latent_shape), device=device, dtype=dtype)
+                schedule = make_lcm_schedule(
+                    num_inference_steps, num_train_timesteps=alphas_cumprod.shape[0]
+                )
+                for i, t in enumerate(schedule):
+                    ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
+                    model_output = wrapper.forward(latents, ts, text_emb, text_info, hint)
+                    eps = predict_eps_from_model_output(
+                        latents, ts, model_output, alphas_cumprod, parameterization
+                    )
+                    t_prev = schedule[i + 1] if i + 1 < len(schedule) else 0
+                    t_prev_tensor = torch.full((batch_size,), t_prev, device=device, dtype=torch.long)
+                    latents = ddim_step(latents, ts, t_prev_tensor, eps, alphas_cumprod)
+
+                pred_img = wrapper.base_model.decode_first_stage(latents)
+        grid = make_preview_grid(
+            batch["img"],
+            batch["masked_img"],
+            batch["hint"],
+            pred_img,
+            max_samples=max_samples,
+        )
+        out_path = out_dir / f"step_{step:07d}.png"
+        torchvision.utils.save_image(grid, out_path)
+        return str(out_path)
+    finally:
+        if was_training:
+            wrapper.base_model.train()
 
 
 def sanitize_hparams(config):
@@ -464,6 +568,12 @@ def main():
     parser.add_argument("--log_image_steps", type=int, default=0)
     parser.add_argument("--log_image_samples", type=int, default=4)
     parser.add_argument("--log_image_dir", type=str, default="")
+    parser.add_argument(
+        "--log_image_infer_steps",
+        type=int,
+        default=4,
+        help="Inference steps used for preview image generation.",
+    )
     parser.add_argument("--train_ratio", type=float, default=0.98)
     parser.add_argument("--val_ratio", type=float, default=0.01)
     parser.add_argument("--test_ratio", type=float, default=0.01)
@@ -772,18 +882,18 @@ def main():
                     )
                     noisy_latents = add_noise(latents, noise, start_timesteps, alphas_cumprod)
 
-                    cond_batch = build_cond_batch(batch, device, non_blocking=non_blocking)
+                    cond_hint, cond_text_info, cond_text_emb = get_cond_cache(
+                        batch, teacher_wrapper, device, non_blocking=non_blocking
+                    )
                     uncond_batch, uncond_text_info, uncond_text_emb = uncond_cache.get(
                         batch, teacher_wrapper, device
                     )
-                    cond_text_info = teacher_wrapper.prepare_text_info(cond_batch)
-                    cond_text_emb = teacher_wrapper.encode_text(cond_batch, cond_text_info)
 
                     w = torch.rand(batch_size, device=device) * (w_max - w_min) + w_min
                     w = w.view(batch_size, 1, 1, 1).to(noisy_latents.dtype)
 
                     noise_pred_cond = teacher_wrapper.forward(
-                        noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                        noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_hint
                     )
                     noise_pred_uncond = teacher_wrapper.forward(
                         noisy_latents, start_timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
@@ -796,7 +906,7 @@ def main():
 
                     if args.target_from_teacher:
                         target_cond = teacher_wrapper.forward(
-                            x_prev, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                            x_prev, timesteps, cond_text_emb, cond_text_info, cond_hint
                         )
                         target_uncond = teacher_wrapper.forward(
                             x_prev, timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
@@ -804,7 +914,7 @@ def main():
                         target_noise_pred = apply_cfg(target_cond, target_uncond, w)
                     else:
                         target_noise_pred = student_wrapper.forward(
-                            x_prev, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                            x_prev, timesteps, cond_text_emb, cond_text_info, cond_hint
                         )
 
                     pred_x0_target = predict_x0_from_model_output(
@@ -818,7 +928,7 @@ def main():
                     target = c_skip * x_prev + c_out * pred_x0_target
 
                     noise_pred_student = student_wrapper.forward(
-                        noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                        noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_hint
                     )
                     pred_x0_student = predict_x0_from_model_output(
                         noisy_latents, start_timesteps, noise_pred_student, alphas_cumprod, parameterization
@@ -933,7 +1043,7 @@ def main():
                 batch_size = batch["img"].shape[0]
 
                 with autocast_context():
-                    with torch.inference_mode():
+                    with torch.no_grad():
                         latents = encode_img_and_masked_x(
                             batch, teacher_wrapper, device, non_blocking=non_blocking
                         )
@@ -946,19 +1056,19 @@ def main():
                     )
                     noisy_latents = add_noise(latents, noise, start_timesteps, alphas_cumprod)
 
-                    cond_batch = build_cond_batch(batch, device, non_blocking=non_blocking)
-                    with torch.inference_mode():
+                    with torch.no_grad():
                         uncond_batch, uncond_text_info, uncond_text_emb = uncond_cache.get(
                             batch, teacher_wrapper, device
                         )
-                        cond_text_info = teacher_wrapper.prepare_text_info(cond_batch)
-                        cond_text_emb = teacher_wrapper.encode_text(cond_batch, cond_text_info)
+                        cond_hint, cond_text_info, cond_text_emb = get_cond_cache(
+                            batch, teacher_wrapper, device, non_blocking=non_blocking
+                        )
 
                         w = torch.rand(batch_size, device=device) * (w_max - w_min) + w_min
                         w = w.view(batch_size, 1, 1, 1).to(noisy_latents.dtype)
 
                         noise_pred_cond = teacher_wrapper.forward(
-                            noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                            noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_hint
                         )
                         noise_pred_uncond = teacher_wrapper.forward(
                             noisy_latents, start_timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
@@ -971,7 +1081,7 @@ def main():
 
                         if args.target_from_teacher:
                             target_cond = teacher_wrapper.forward(
-                                x_prev, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                                x_prev, timesteps, cond_text_emb, cond_text_info, cond_hint
                             )
                             target_uncond = teacher_wrapper.forward(
                                 x_prev, timesteps, uncond_text_emb, uncond_text_info, uncond_batch["hint"]
@@ -979,7 +1089,7 @@ def main():
                             target_noise_pred = apply_cfg(target_cond, target_uncond, w)
                         else:
                             target_noise_pred = student_wrapper.forward(
-                                x_prev, timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                                x_prev, timesteps, cond_text_emb, cond_text_info, cond_hint
                             )
 
                         pred_x0_target = predict_x0_from_model_output(
@@ -993,13 +1103,11 @@ def main():
                         target = c_skip * x_prev + c_out * pred_x0_target
 
                     noise_pred_student = student_wrapper.forward(
-                        noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_batch["hint"]
+                        noisy_latents, start_timesteps, cond_text_emb, cond_text_info, cond_hint
                     )
                     pred_x0_student = predict_x0_from_model_output(
                         noisy_latents, start_timesteps, noise_pred_student, alphas_cumprod, parameterization
                     )
-                    pred_x0_detached = pred_x0_student.detach()
-
                     c_skip_start, c_out_start = scalings_for_boundary_conditions(
                         start_timesteps, sigma_data=sigma_data, timestep_scaling=timestep_scaling
                     )
@@ -1075,13 +1183,18 @@ def main():
 
                     if args.log_image_steps > 0 and global_step % args.log_image_steps == 0:
                         if accelerator.is_local_main_process:
-                            log_train_images(
+                            log_train_images_infer(
                                 global_step,
                                 batch,
-                                pred_x0_detached,
                                 student_wrapper,
                                 log_image_dir,
                                 max_samples=args.log_image_samples,
+                                num_inference_steps=args.log_image_infer_steps,
+                                alphas_cumprod=alphas_cumprod,
+                                parameterization=parameterization,
+                                device=device,
+                                autocast_context=autocast_context,
+                                non_blocking=non_blocking,
                             )
 
                     if args.save_steps > 0 and global_step % args.save_steps == 0:

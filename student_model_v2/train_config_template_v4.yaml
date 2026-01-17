@@ -34,8 +34,8 @@ train:
   use_optimized: true  # ignored when train_script is set
   add_time_suffix: true  # create output_dir/train_<time> for each new run (disabled when resuming)
   train_script: student_model_v2/train_lcm_anytext_v2_4.py
-  train_batch_size: 1
-  gradient_accumulation_steps: 32
+  train_batch_size: 6
+  gradient_accumulation_steps: 5
   learning_rate: 1e-4
   w_min: 5.0
   w_max: 15.0
@@ -49,15 +49,15 @@ train:
   max_train_steps: 50000
   max_epochs: 0  # set >0 to use epoch-driven training (overrides max_train_steps)
   resume_path: ""  # e.g. student_model_v2/checkpoints/checkpoint-2000
-  resume_optimizer: false
-  resume_add_steps: 3000  # 0 uses max_train_steps when resuming
+  resume_optimizer: false # false
+  resume_add_steps: 0  # 0 uses max_train_steps when resuming
   mixed_precision: fp16
   lora_rank: 64
   lora_alpha: 64
   lora_dropout: 0.0
   num_inference_steps: 50
   cfg_scale: 7.5  # fallback if w_min/w_max are omitted
-  num_workers: 4
+  num_workers: 8
   prefetch_factor: 4
   persistent_workers: true
   pin_memory: true
@@ -72,8 +72,9 @@ train:
   logging_steps: 10
   log_image_steps: 500  # 0 to disable preview images
   log_image_samples: 4
+  log_image_infer_steps: 4
   log_image_dir: ""  # empty uses output_dir/train_img
-  eval_batches: 1
+  eval_batches: 0  # 跳过验证，如果需要验证，设置为 1
   eval_num_workers: 0
   eval_timeout: 0
   train_ratio: 0.98

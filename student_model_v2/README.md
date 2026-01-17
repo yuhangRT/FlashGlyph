@@ -105,7 +105,7 @@ CUDA_VISIBLE_DEVICES=1,2 python student_model_v2/oom_guard.py --min-available-gb
   --config student_model_v2/train_config_template_v4.yaml
 ```
 
-可调参数：`w_min/w_max`（随机 CFG）、`lcm_step`（步长）、`target_from_teacher`（更严格但更耗显存）。
+可调参数：`w_min/w_max`（随机 CFG）、`lcm_step`（步长）、`target_from_teacher`（更严格但更耗显存）、`log_image_infer_steps`（预览推理步数）。
 
 
 ## 训练（多域损失 v3：LCM + FFL + Masked Grad）
@@ -365,3 +365,9 @@ def ddim_step(noise_pred, timesteps, latents, alphas_cumprod, eta=0.0):
 修正后，写出了v3版本
 
 ## v2_4版本（在v2_2上修改核心算法，遵循lcm-lora）
+训练命令：
+```
+CUDA_VISIBLE_DEVICES=1,2 python student_model_v2/oom_guard.py --min-available-gb 4 \
+  accelerate launch --num_processes 2 student_model_v2/launch_from_yaml.py \
+  --config student_model_v2/train_config_template_v4.yaml
+```
