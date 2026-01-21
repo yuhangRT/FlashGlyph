@@ -57,6 +57,8 @@ def _worker_init_fn(worker_threads, cv2_threads, _):
         torch.set_num_threads(int(worker_threads))
 
 
+
+
 def unwrap_controlldm(model):
     if isinstance(model, ControlLDM):
         return model
@@ -433,6 +435,7 @@ def log_train_images_infer(
                 dtype = next(wrapper.base_model.parameters()).dtype
 
                 latents = torch.randn((batch_size, *latent_shape), device=device, dtype=dtype)
+                # latents = torch.randn((batch_size, *latent_shape), device=device, dtype=dtype) * wrapper.base_model.scale_factor
                 schedule = make_lcm_schedule(
                     num_inference_steps, num_train_timesteps=alphas_cumprod.shape[0]
                 )
@@ -460,6 +463,21 @@ def log_train_images_infer(
     finally:
         if was_training:
             wrapper.base_model.train()
+
+
+def _parse_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
 def sanitize_hparams(config):
@@ -522,6 +540,12 @@ def main():
     parser.add_argument("--output_dir", type=str, default="student_model_v2/checkpoints")
     parser.add_argument("--dataset_json", type=str, nargs="+", default=["demodataset/annotations/demo_data.json"])
     parser.add_argument("--lmdb_path", type=str, default="", help="Optional LMDB cache path for dataset.")
+    parser.add_argument(
+        "--font_hint_randaug",
+        type=str,
+        default="true",
+        help="Enable online random augmentation for font hints (true|false).",
+    )
     parser.add_argument("--use_mock_dataset", action="store_true")
     parser.add_argument("--resume_path", type=str, default="")
     parser.add_argument("--resume_optimizer", action="store_true", default=False)
@@ -599,6 +623,8 @@ def main():
     parser.add_argument("--cache_dir", type=str, default="")
     parser.add_argument("--auto_list_path", type=str, default="")
     args = parser.parse_args()
+
+    args.font_hint_randaug = _parse_bool(args.font_hint_randaug, default=True)
 
     if args.w_min is None:
         args.w_min = float(args.cfg_scale)
@@ -734,6 +760,10 @@ def main():
         cache_dir = args.cache_dir.strip() if args.cache_dir else ""
         if cache_dir:
             cache_dir = str((repo_root / cache_dir).resolve()) if not os.path.isabs(cache_dir) else cache_dir
+        if args.lmdb_path:
+            lmdb_path = args.lmdb_path.strip()
+            lmdb_path = str((repo_root / lmdb_path).resolve()) if not os.path.isabs(lmdb_path) else lmdb_path
+            args.lmdb_path = lmdb_path
         datasets = [
             RealAnyTextDataset(
                 json_path=path,
@@ -743,6 +773,7 @@ def main():
                 streaming_threshold_mb=args.streaming_threshold_mb,
                 cache_dir=cache_dir or None,
                 lmdb_path=args.lmdb_path or None,
+                font_hint_randaug=args.font_hint_randaug,
             )
             for path in json_paths
         ]

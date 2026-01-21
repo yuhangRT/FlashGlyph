@@ -33,6 +33,7 @@ _INDEX_STRUCT = struct.Struct("Q")
 _INDEX_ITEM_SIZE = _INDEX_STRUCT.size
 LMDB_META_KEY = b"__meta__"
 LMDB_META_VERSION = 1
+LMDB_META_VERSIONS = {1, 2}
 _FONT_CACHE = {}
 _FONT_CACHE_MAX = 100
 
@@ -926,7 +927,7 @@ class RealAnyTextDataset(Dataset):
             else:
                 expected_font = str(Path(self.font_path).resolve())
                 if (
-                    int(meta.get("version", -1)) == LMDB_META_VERSION
+                    int(meta.get("version", -1)) in LMDB_META_VERSIONS
                     and int(meta.get("resolution", -1)) == int(self.resolution)
                     and int(meta.get("max_chars", -1)) == int(self.max_chars)
                     and str(meta.get("font_path", "")) == expected_font

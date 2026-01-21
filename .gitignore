@@ -3,6 +3,8 @@
 .claude
 .tmp_focal_frequency_loss
 
+latent-consistency-model
+
 training/
 lightning_logs/
 image_log/

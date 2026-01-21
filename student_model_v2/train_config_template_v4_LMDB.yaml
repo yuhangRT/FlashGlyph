@@ -8,7 +8,7 @@ model:
 data:
   cache_dir: dataset_cache/anytext2
   auto_list_path: dataset_cache/anytext2/train_paths.list
-  lmdb_path: dataset_cache/anytext2_lmdb  # optional LMDB cache (see README)
+  lmdb_path: dataset_cache/lmdb/anytext2_full  # optional LMDB cache (see README)
   # 使用小数据集进行测试
   dataset_json:
     # - demodataset/annotations/demo_data.json
@@ -30,6 +30,7 @@ data:
   wm_thresh: 1.0
   streaming: true
   streaming_threshold_mb: 200
+  font_hint_randaug: false
 
 train:
   use_optimized: true  # ignored when train_script is set
@@ -38,8 +39,8 @@ train:
   train_batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 1e-4
-  w_min: 5.0
-  w_max: 15.0
+  w_min: 7.5
+  w_max: 7.5
   lcm_step: 1
   sigma_data: 0.5
   timestep_scaling: 10.0

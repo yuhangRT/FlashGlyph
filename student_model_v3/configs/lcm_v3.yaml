@@ -1,17 +1,11 @@
-# AnyText2 LCM-LoRA distillation template (v2.4, trajectory consistency)
-
 model:
   config: models_yaml/anytext2_sd15.yaml
   teacher_ckpt: models/anytext_v2.0.ckpt
-  output_dir: student_model_v2/checkpoints
+  output_dir: student_model_v3/checkpoints
 
 data:
   cache_dir: dataset_cache/anytext2
-  auto_list_path: dataset_cache/anytext2/train_paths.list
-  # 使用小数据集进行测试
   dataset_json:
-    # - demodataset/annotations/demo_data.json
-    # 大数据集（注释掉）：
     - dataset/anytext2_json_files/anytext2_json_files/ocr_data/Art/data_v1.2b.json
     - dataset/anytext2_json_files/anytext2_json_files/ocr_data/COCO_Text/data_v1.2b.json
     - dataset/anytext2_json_files/anytext2_json_files/ocr_data/icdar2017rctw/data_v1.2b.json
@@ -31,57 +25,37 @@ data:
   streaming_threshold_mb: 200
 
 train:
-  use_optimized: true  # ignored when train_script is set
-  add_time_suffix: true  # create output_dir/train_<time> for each new run (disabled when resuming)
-  train_script: student_model_v2/train_lcm_anytext_v2_4.py
+  train_script: student_model_v3/train_lcm_anytext_v3.py
   train_batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 1e-4
-  w_min: 7.5
-  w_max: 7.5
-  lcm_step: 1
-  sigma_data: 0.5
-  timestep_scaling: 10.0
-  target_from_teacher: true
-  lr_scheduler: warmup_cosine  # none | warmup_cosine
-  lr_warmup_steps: 500
+  lr_scheduler: none
+  lr_warmup_steps: 0
   lr_min_ratio: 0.0
   max_train_steps: 50000
-  max_epochs: 0  # set >0 to use epoch-driven training (overrides max_train_steps)
-  resume_path: ""  # e.g. student_model_v2/checkpoints/checkpoint-2000
-  resume_optimizer: false # false
-  resume_add_steps: 0  # 0 uses max_train_steps when resuming
+  max_epochs: 0
   mixed_precision: fp16
   lora_rank: 64
   lora_alpha: 64
   lora_dropout: 0.0
-  num_inference_steps: 50
-  cfg_scale: 7.5  # fallback if w_min/w_max are omitted
+  num_ddim_timesteps: 50
+  num_inference_steps: 4
+  w_min: 5.0
+  w_max: 15.0
+  loss_type: l2
+  huber_c: 0.001
+  logging_steps: 10
+  save_steps: 2000
   num_workers: 8
   prefetch_factor: 4
   persistent_workers: true
   pin_memory: true
-  mp_context: ""
   worker_num_threads: 1
   cv2_num_threads: 1
   allow_tf32: true
   cudnn_benchmark: true
   matmul_precision: high
-  save_steps: 2000
-  save_epochs: 0  # set >0 to save checkpoints by epoch
-  logging_steps: 10
-  log_image_steps: 50  # 0 to disable preview images
-  log_image_samples: 4
-  log_image_infer_steps: 4
-  log_image_dir: ""  # empty uses output_dir/train_img
-  eval_batches: 0  # 跳过验证，如果需要验证，设置为 1
-  eval_num_workers: 0
-  eval_timeout: 0
-  train_ratio: 0.98
-  val_ratio: 0.01
-  test_ratio: 0.01
   seed: 42
 
 system:
-  num_gpus: 2
-  notes: "Use accelerate launch --multi_gpu. Adjust train_batch_size if OOM."
+  notes: "Official-style LCM-LoRA distillation for AnyText2 (v3)."
