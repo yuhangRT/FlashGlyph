@@ -5,6 +5,7 @@ model:
 
 data:
   cache_dir: dataset_cache/anytext2
+  lmdb_path: dataset_cache/lmdb/anytext2_full
   dataset_json:
     - dataset/anytext2_json_files/anytext2_json_files/ocr_data/Art/data_v1.2b.json
     - dataset/anytext2_json_files/anytext2_json_files/ocr_data/COCO_Text/data_v1.2b.json
@@ -23,6 +24,7 @@ data:
   wm_thresh: 1.0
   streaming: true
   streaming_threshold_mb: 200
+  font_hint_randaug: false
 
 train:
   train_script: student_model_v3/train_lcm_anytext_v3.py
@@ -45,6 +47,11 @@ train:
   loss_type: l2
   huber_c: 0.001
   logging_steps: 10
+  log_image_steps: 500
+  log_image_samples: 4
+  log_image_infer_steps: 4
+  timing_steps: 0
+  timing_cuda_sync: false
   save_steps: 2000
   num_workers: 8
   prefetch_factor: 4

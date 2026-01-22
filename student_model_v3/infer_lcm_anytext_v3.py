@@ -17,6 +17,55 @@ from student_model_v2.lcm_utils_v2 import (
 from student_model_v3.wrappers import AnyText2ForwardWrapper
 
 
+def _find_latest_run_dir(base_dir):
+    if not base_dir.exists():
+        return None
+    candidates = [p for p in base_dir.iterdir() if p.is_dir() and p.name.startswith("train_")]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def resolve_lora_path(path_str):
+    path = Path(path_str).expanduser()
+    if path.exists():
+        if path.is_dir() and (path / "adapter_config.json").exists():
+            return path
+        # If a run dir was provided, try checkpoint-final inside it.
+        if path.is_dir() and path.name.startswith("train_"):
+            candidate = path / "checkpoint-final"
+            if (candidate / "adapter_config.json").exists():
+                return candidate
+        # If a checkpoints dir is provided, pick latest run/checkpoint-final.
+        if path.is_dir() and path.name == "checkpoints":
+            latest = _find_latest_run_dir(path)
+            if latest:
+                candidate = latest / "checkpoint-final"
+                if (candidate / "adapter_config.json").exists():
+                    return candidate
+        return path
+
+    # Path doesn't exist: try to resolve under checkpoints/train_*/checkpoint-final.
+    checkpoints_dir = (Path(__file__).parent / "checkpoints").resolve()
+    if path.name.startswith("checkpoint") or path.name == "checkpoint-final":
+        base = path.parent
+        if base.name == "checkpoints":
+            latest = _find_latest_run_dir(base)
+            if latest:
+                candidate = latest / path.name
+                if (candidate / "adapter_config.json").exists():
+                    return candidate
+    # Fallback to student_model_v3/checkpoints if base not found.
+    if checkpoints_dir.exists():
+        latest = _find_latest_run_dir(checkpoints_dir)
+        if latest:
+            candidate = latest / "checkpoint-final"
+            if (candidate / "adapter_config.json").exists():
+                return candidate
+    return path
+
+
 def encode_img_and_masked_x(batch, wrapper, device):
     img = batch["img"]
     masked_img = batch.get("masked_img", img)
@@ -118,8 +167,13 @@ def main():
 
     if args.student_lora_path:
         from peft import PeftModel
-
-        model = PeftModel.from_pretrained(model, args.student_lora_path, is_trainable=False)
+        lora_path = resolve_lora_path(args.student_lora_path)
+        if not (Path(lora_path) / "adapter_config.json").exists():
+            raise ValueError(
+                f"Can't find 'adapter_config.json' at '{lora_path}'. "
+                "Pass a specific checkpoint directory or the checkpoints root."
+            )
+        model = PeftModel.from_pretrained(model, str(lora_path), is_trainable=False)
 
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
