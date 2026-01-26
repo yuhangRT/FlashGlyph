@@ -40,6 +40,7 @@ from student_model_v3.lcm_solver import (
     scalings_for_boundary_conditions,
 )
 from student_model_v3.wrappers import AnyText2ForwardWrapper
+from student_model_v3.losses import HighFreqTextLoss
 
 
 def _worker_init_fn(worker_threads, cv2_threads, _):
@@ -405,6 +406,15 @@ def main():
     parser.add_argument("--w_max", type=float, default=15.0)
     parser.add_argument("--loss_type", type=str, default="l2", choices=["l2", "huber"])
     parser.add_argument("--huber_c", type=float, default=0.001)
+    parser.add_argument("--loss_ffl_weight", type=float, default=0.0)
+    parser.add_argument("--loss_grad_weight", type=float, default=0.0)
+    parser.add_argument("--ffl_alpha", type=float, default=1.0)
+    parser.add_argument("--ffl_patch_factor", type=int, default=1)
+    parser.add_argument("--ffl_ave_spectrum", action="store_true", default=False)
+    parser.add_argument("--ffl_log_matrix", action="store_true", default=False)
+    parser.add_argument("--ffl_batch_matrix", action="store_true", default=False)
+    parser.add_argument("--loss_mask_key", type=str, default="hint", choices=["hint", "positions", "inv_mask"])
+    parser.add_argument("--loss_text_weight", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--log_image_steps", type=int, default=0)
@@ -639,6 +649,40 @@ def main():
     log_image_dir = os.path.join(args.output_dir, "train_img")
     non_blocking = bool(args.pin_memory)
 
+    high_freq_loss = None
+    if args.loss_ffl_weight > 0 or args.loss_grad_weight > 0:
+        high_freq_loss = HighFreqTextLoss(
+            ffl_weight=args.loss_ffl_weight,
+            grad_weight=args.loss_grad_weight,
+            ffl_alpha=args.ffl_alpha,
+            ffl_patch_factor=args.ffl_patch_factor,
+            ffl_ave_spectrum=args.ffl_ave_spectrum,
+            ffl_log_matrix=args.ffl_log_matrix,
+            ffl_batch_matrix=args.ffl_batch_matrix,
+            text_weight=args.loss_text_weight,
+        ).to(device)
+
+    def get_text_mask(batch):
+        key = args.loss_mask_key
+        mask = None
+        if key == "hint":
+            mask = batch.get("hint")
+        elif key == "positions":
+            positions = batch.get("positions")
+            if positions:
+                mask = torch.stack(positions, dim=0).amax(dim=0)
+        elif key == "inv_mask":
+            inv_mask = batch.get("inv_mask")
+            if inv_mask is not None:
+                mask = 1.0 - inv_mask
+        else:
+            mask = batch.get("hint")
+        if mask is None:
+            return None
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        return mask.float()
+
     autocast_context = accelerator.autocast if hasattr(accelerator, "autocast") else nullcontext
     steps_per_epoch = max(1, math.ceil(len(train_loader) / args.gradient_accumulation_steps))
     if args.max_epochs > 0:
@@ -812,11 +856,24 @@ def main():
                     _maybe_sync(timing_sync)
                     t0 = time.perf_counter()
                     if args.loss_type == "l2":
-                        loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                        loss_base = torch.nn.functional.mse_loss(
+                            model_pred.float(), target.float(), reduction="mean"
+                        )
                     else:
-                        loss = torch.mean(
+                        loss_base = torch.mean(
                             torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
                         )
+                    loss = loss_base
+                    loss_ffl = loss_base.new_tensor(0.0)
+                    loss_grad = loss_base.new_tensor(0.0)
+                    if high_freq_loss is not None:
+                        text_mask = get_text_mask(batch)
+                        if text_mask is not None:
+                            text_mask = text_mask.to(device, non_blocking=non_blocking)
+                        hf_total, hf_dict = high_freq_loss(pred_x0, pred_x0_target, mask=text_mask)
+                        loss = loss + hf_total
+                        loss_ffl = hf_dict["ffl"]
+                        loss_grad = hf_dict["grad"]
                     _maybe_sync(timing_sync)
                     loss_time = time.perf_counter() - t0 if timing_enabled else 0.0
 
@@ -854,16 +911,26 @@ def main():
                 if args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     now = time.perf_counter()
                     loss_val = loss.detach().float().item()
+                    loss_base_val = loss_base.detach().float().item()
+                    ffl_val = None
+                    grad_val = None
+                    if high_freq_loss is not None:
+                        ffl_val = loss_ffl.detach().float().item()
+                        grad_val = loss_grad.detach().float().item()
                     ema_loss = loss_val if ema_loss is None else (0.9 * ema_loss + 0.1 * loss_val)
                     it_s = (global_step - last_log_step) / max(now - last_log_time, 1e-6)
                     lr = optimizer.param_groups[0]["lr"]
                     postfix = {
                         "loss": f"{loss_val:.4f}",
+                        "lcm": f"{loss_base_val:.4f}",
                         "ema": f"{ema_loss:.4f}",
                         "lr": f"{lr:.2e}",
                         "it/s": f"{it_s:.2f}",
                         "epoch": f"{epoch + 1}/{max_epochs}",
                     }
+                    if ffl_val is not None and grad_val is not None:
+                        postfix["ffl"] = f"{ffl_val:.4f}"
+                        postfix["grad"] = f"{grad_val:.4f}"
                     if torch.cuda.is_available():
                         mem_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                         postfix["mem_gb"] = f"{mem_gb:.1f}"
@@ -889,12 +956,21 @@ def main():
                         {
                             "train/loss": loss_val,
                             "train/loss_ema": ema_loss,
+                            "train/lcm": loss_base_val,
                             "train/lr": lr,
                             "train/it_s": it_s,
                             "train/epoch": epoch + 1,
                         },
                         step=global_step,
                     )
+                    if ffl_val is not None and grad_val is not None:
+                        accelerator.log(
+                            {
+                                "train/ffl": ffl_val,
+                                "train/grad": grad_val,
+                            },
+                            step=global_step,
+                        )
                     last_log_step = global_step
                     last_log_time = now
 
