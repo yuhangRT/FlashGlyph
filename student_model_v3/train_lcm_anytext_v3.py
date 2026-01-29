@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torchvision
+import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -232,6 +233,8 @@ def log_train_images_infer(
     output_dir,
     max_samples,
     num_inference_steps,
+    cfg_scale,
+    use_cfg,
     alphas_cumprod,
     parameterization,
     device,
@@ -248,9 +251,14 @@ def log_train_images_infer(
     try:
         with torch.no_grad():
             with autocast_context():
-                hint, text_info, text_emb = get_cond_cache(
-                    batch, wrapper, device, non_blocking=non_blocking
-                )
+                cond_batch = build_cond_batch(batch, device, non_blocking=non_blocking)
+                uncond_batch = build_uncond_batch(cond_batch)
+
+                text_info = wrapper.prepare_text_info(cond_batch)
+                text_emb = wrapper.encode_text(cond_batch, text_info)
+                uncond_text_info = wrapper.prepare_text_info(uncond_batch)
+                uncond_text_emb = wrapper.encode_text(uncond_batch, uncond_text_info)
+                hint = cond_batch["hint"]
                 batch_size = hint.shape[0]
                 latent_shape = batch["masked_x"].shape[1:]
                 dtype = next(wrapper.base_model.parameters()).dtype
@@ -259,9 +267,16 @@ def log_train_images_infer(
                 schedule = make_lcm_schedule(
                     num_inference_steps, num_train_timesteps=alphas_cumprod.shape[0]
                 )
+                use_cfg = use_cfg or cfg_scale > 1.0
                 for i, t in enumerate(schedule):
                     ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
-                    model_output = wrapper.forward(latents, ts, text_emb, text_info, hint)
+                    if use_cfg:
+                        # CFG for visualization: combine cond/uncond predictions.
+                        eps_cond = wrapper.forward(latents, ts, text_emb, text_info, hint)
+                        eps_uncond = wrapper.forward(latents, ts, uncond_text_emb, uncond_text_info, hint)
+                        model_output = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+                    else:
+                        model_output = wrapper.forward(latents, ts, text_emb, text_info, hint)
                     eps = predict_eps_from_model_output(
                         latents, ts, model_output, alphas_cumprod, parameterization
                     )
@@ -402,10 +417,13 @@ def main():
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--num_ddim_timesteps", type=int, default=50)
     parser.add_argument("--num_inference_steps", type=int, default=4)
+    parser.add_argument("--cfg_scale", type=float, default=7.5)
+    parser.add_argument("--use_cfg", action="store_true", default=False)
     parser.add_argument("--w_min", type=float, default=5.0)
     parser.add_argument("--w_max", type=float, default=15.0)
     parser.add_argument("--loss_type", type=str, default="l2", choices=["l2", "huber"])
     parser.add_argument("--huber_c", type=float, default=0.001)
+    parser.add_argument("--loss_teacher_x0_weight", type=float, default=0.0)
     parser.add_argument("--loss_ffl_weight", type=float, default=0.0)
     parser.add_argument("--loss_grad_weight", type=float, default=0.0)
     parser.add_argument("--ffl_alpha", type=float, default=1.0)
@@ -683,6 +701,34 @@ def main():
             mask = mask.unsqueeze(1)
         return mask.float()
 
+    def _normalize_text_mask(mask, target_shape):
+        if mask is None:
+            return None
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        if mask.dim() == 4 and mask.shape[1] > 1:
+            mask = mask.max(dim=1, keepdim=True).values
+        if mask.shape[-2:] != target_shape[-2:]:
+            mask = F.interpolate(mask, size=target_shape[-2:], mode="nearest")
+        return (mask > 0.5).float()
+
+    def _loss_elementwise(pred, target):
+        if args.loss_type == "l2":
+            return (pred - target) ** 2
+        return torch.sqrt((pred - target) ** 2 + args.huber_c**2) - args.huber_c
+
+    def compute_mask_weighted_loss(pred, target, mask):
+        err = _loss_elementwise(pred, target)
+        if mask is None:
+            return err.mean(), None
+        mask_lat = _normalize_text_mask(mask, pred.shape)
+        if mask_lat is None:
+            return err.mean(), None
+        # Emphasize text regions in the main LCM consistency loss.
+        weight = 1.0 + (args.loss_text_weight - 1.0) * mask_lat
+        weighted = (err * weight).mean() / (weight.mean() + 1e-8)
+        return weighted, mask_lat
+
     autocast_context = accelerator.autocast if hasattr(accelerator, "autocast") else nullcontext
     steps_per_epoch = max(1, math.ceil(len(train_loader) / args.gradient_accumulation_steps))
     if args.max_epochs > 0:
@@ -787,7 +833,7 @@ def main():
                     noise_pred = student_wrapper.forward(
                         noisy_latents, start_timesteps, cond_text_emb, cond_text_info, hint
                     )
-                    pred_x0 = predicted_origin(
+                    student_pred_x0 = predicted_origin(
                         noise_pred,
                         start_timesteps,
                         noisy_latents,
@@ -795,7 +841,7 @@ def main():
                         alpha_schedule,
                         sigma_schedule,
                     )
-                    model_pred = c_skip_start * noisy_latents + c_out_start * pred_x0
+                    model_pred = c_skip_start * noisy_latents + c_out_start * student_pred_x0
                     _maybe_sync(timing_sync)
                     student_time = time.perf_counter() - t0 if timing_enabled else 0.0
 
@@ -828,9 +874,9 @@ def main():
                         w = (args.w_max - args.w_min) * torch.rand((batch_size,), device=device) + args.w_min
                         w = w.reshape(batch_size, 1, 1, 1).to(noisy_latents.dtype)
 
-                        pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
+                        teacher_guided_pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
                         pred_noise = cond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
-                        x_prev = solver.ddim_step(pred_x0, pred_noise, index)
+                        x_prev = solver.ddim_step(teacher_guided_pred_x0, pred_noise, index)
                         x_prev = x_prev.to(device=noisy_latents.device, dtype=noisy_latents.dtype)
                         _maybe_sync(timing_sync)
                         teacher_time = time.perf_counter() - t0 if timing_enabled else 0.0
@@ -855,22 +901,30 @@ def main():
 
                     _maybe_sync(timing_sync)
                     t0 = time.perf_counter()
-                    if args.loss_type == "l2":
-                        loss_base = torch.nn.functional.mse_loss(
-                            model_pred.float(), target.float(), reduction="mean"
-                        )
-                    else:
-                        loss_base = torch.mean(
-                            torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
-                        )
+                    text_mask = get_text_mask(batch)
+                    if text_mask is not None:
+                        text_mask = text_mask.to(device, non_blocking=non_blocking)
+                    loss_base_raw = _loss_elementwise(model_pred.float(), target.float()).mean()
+                    loss_base, mask_lat = compute_mask_weighted_loss(
+                        model_pred.float(), target.float(), text_mask
+                    )
                     loss = loss_base
+                    loss_teacher_x0 = loss_base.new_tensor(0.0)
+                    if args.loss_teacher_x0_weight > 0:
+                        if mask_lat is None:
+                            weight = None
+                        else:
+                            weight = 1.0 + (args.loss_text_weight - 1.0) * mask_lat
+                        l1_err = (student_pred_x0 - teacher_guided_pred_x0).abs()
+                        if weight is None:
+                            loss_teacher_x0 = l1_err.mean()
+                        else:
+                            loss_teacher_x0 = (l1_err * weight).mean() / (weight.mean() + 1e-8)
+                        loss = loss + args.loss_teacher_x0_weight * loss_teacher_x0
                     loss_ffl = loss_base.new_tensor(0.0)
                     loss_grad = loss_base.new_tensor(0.0)
                     if high_freq_loss is not None:
-                        text_mask = get_text_mask(batch)
-                        if text_mask is not None:
-                            text_mask = text_mask.to(device, non_blocking=non_blocking)
-                        hf_total, hf_dict = high_freq_loss(pred_x0, pred_x0_target, mask=text_mask)
+                        hf_total, hf_dict = high_freq_loss(teacher_guided_pred_x0, pred_x0_target, mask=text_mask)
                         loss = loss + hf_total
                         loss_ffl = hf_dict["ffl"]
                         loss_grad = hf_dict["grad"]
@@ -912,6 +966,9 @@ def main():
                     now = time.perf_counter()
                     loss_val = loss.detach().float().item()
                     loss_base_val = loss_base.detach().float().item()
+                    loss_base_raw_val = loss_base_raw.detach().float().item()
+                    mask_ratio = mask_lat.mean().detach().float().item() if mask_lat is not None else None
+                    loss_teacher_x0_val = loss_teacher_x0.detach().float().item()
                     ffl_val = None
                     grad_val = None
                     if high_freq_loss is not None:
@@ -923,11 +980,16 @@ def main():
                     postfix = {
                         "loss": f"{loss_val:.4f}",
                         "lcm": f"{loss_base_val:.4f}",
+                        "lcm_raw": f"{loss_base_raw_val:.4f}",
                         "ema": f"{ema_loss:.4f}",
                         "lr": f"{lr:.2e}",
                         "it/s": f"{it_s:.2f}",
                         "epoch": f"{epoch + 1}/{max_epochs}",
                     }
+                    if mask_ratio is not None:
+                        postfix["mask"] = f"{mask_ratio:.3f}"
+                    if args.loss_teacher_x0_weight > 0:
+                        postfix["x0"] = f"{loss_teacher_x0_val:.4f}"
                     if ffl_val is not None and grad_val is not None:
                         postfix["ffl"] = f"{ffl_val:.4f}"
                         postfix["grad"] = f"{grad_val:.4f}"
@@ -957,6 +1019,9 @@ def main():
                             "train/loss": loss_val,
                             "train/loss_ema": ema_loss,
                             "train/lcm": loss_base_val,
+                            "train/lcm_raw": loss_base_raw_val,
+                            "train/mask_ratio": mask_ratio if mask_ratio is not None else 0.0,
+                            "train/teacher_x0": loss_teacher_x0_val,
                             "train/lr": lr,
                             "train/it_s": it_s,
                             "train/epoch": epoch + 1,
@@ -983,6 +1048,8 @@ def main():
                             log_image_dir,
                             max_samples=args.log_image_samples,
                             num_inference_steps=args.log_image_infer_steps,
+                            cfg_scale=args.cfg_scale,
+                            use_cfg=args.use_cfg,
                             alphas_cumprod=alphas_cumprod,
                             parameterization=parameterization,
                             device=device,

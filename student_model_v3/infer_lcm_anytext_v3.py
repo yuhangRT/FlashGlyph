@@ -99,6 +99,14 @@ def build_cond_batch(batch, device):
     }
 
 
+def build_uncond_batch(cond_batch):
+    batch_size = cond_batch["img"].shape[0]
+    uncond_batch = dict(cond_batch)
+    uncond_batch["img_caption"] = [""] * batch_size
+    uncond_batch["text_caption"] = [""] * batch_size
+    return uncond_batch
+
+
 def _ensure_nchw(tensor):
     if tensor.dim() == 3:
         if tensor.shape[0] in (1, 3):
@@ -152,6 +160,8 @@ def main():
     parser.add_argument("--num_inference_steps", type=int, default=4)
     parser.add_argument("--max_samples", type=int, default=4)
     parser.add_argument("--output", type=str, default="student_model_v3/preview.png")
+    parser.add_argument("--cfg_scale", type=float, default=7.5)
+    parser.add_argument("--use_cfg", action="store_true", default=False)
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -194,9 +204,12 @@ def main():
     batch = next(iter(loader))
     encode_img_and_masked_x(batch, wrapper, device)
     cond_batch = build_cond_batch(batch, device)
+    uncond_batch = build_uncond_batch(cond_batch)
 
     text_info = wrapper.prepare_text_info(cond_batch)
     text_emb = wrapper.encode_text(cond_batch, text_info)
+    uncond_text_info = wrapper.prepare_text_info(uncond_batch)
+    uncond_text_emb = wrapper.encode_text(uncond_batch, uncond_text_info)
     hint = cond_batch["hint"]
 
     alphas_cumprod = wrapper.base_model.alphas_cumprod.to(device)
@@ -208,9 +221,16 @@ def main():
 
     latents = torch.randn((batch_size, *latent_shape), device=device, dtype=dtype)
     schedule = make_lcm_schedule(args.num_inference_steps, num_train_timesteps=alphas_cumprod.shape[0])
+    use_cfg = args.use_cfg or args.cfg_scale > 1.0
     for i, t in enumerate(schedule):
         ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
-        model_output = wrapper.forward(latents, ts, text_emb, text_info, hint)
+        if use_cfg:
+            # CFG: combine cond/uncond outputs to strengthen text adherence.
+            eps_cond = wrapper.forward(latents, ts, text_emb, text_info, hint)
+            eps_uncond = wrapper.forward(latents, ts, uncond_text_emb, uncond_text_info, hint)
+            model_output = eps_uncond + args.cfg_scale * (eps_cond - eps_uncond)
+        else:
+            model_output = wrapper.forward(latents, ts, text_emb, text_info, hint)
         eps = predict_eps_from_model_output(latents, ts, model_output, alphas_cumprod, parameterization)
         t_prev = schedule[i + 1] if i + 1 < len(schedule) else 0
         t_prev_tensor = torch.full((batch_size,), t_prev, device=device, dtype=torch.long)
