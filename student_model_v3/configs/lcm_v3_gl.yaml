@@ -56,7 +56,7 @@ train:
   ffl_ave_spectrum: false
   ffl_log_matrix: false
   ffl_batch_matrix: false
-  loss_mask_key: hint
+  loss_mask_key: inv_mask
   loss_text_weight: 5.0
   logging_steps: 10
   log_image_steps: 500

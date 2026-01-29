@@ -431,7 +431,7 @@ def main():
     parser.add_argument("--ffl_ave_spectrum", action="store_true", default=False)
     parser.add_argument("--ffl_log_matrix", action="store_true", default=False)
     parser.add_argument("--ffl_batch_matrix", action="store_true", default=False)
-    parser.add_argument("--loss_mask_key", type=str, default="hint", choices=["hint", "positions", "inv_mask"])
+    parser.add_argument("--loss_mask_key", type=str, default="inv_mask", choices=["hint", "positions", "inv_mask"])
     parser.add_argument("--loss_text_weight", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -680,8 +680,8 @@ def main():
             text_weight=args.loss_text_weight,
         ).to(device)
 
-    def get_text_mask(batch):
-        key = args.loss_mask_key
+    def get_text_mask(batch, mask_key=args.loss_mask_key, threshold=args.wm_thresh):
+        key = mask_key
         mask = None
         if key == "hint":
             mask = batch.get("hint")
@@ -699,7 +699,11 @@ def main():
             return None
         if mask.dim() == 3:
             mask = mask.unsqueeze(1)
-        return mask.float()
+        # Avoid invalid thresholds: fall back to 0.5 for binarization.
+        thr = 0.5
+        if threshold is not None and 0.0 < float(threshold) < 1.0:
+            thr = float(threshold)
+        return (mask > thr).float()
 
     def _normalize_text_mask(mask, target_shape):
         if mask is None:
@@ -712,20 +716,20 @@ def main():
             mask = F.interpolate(mask, size=target_shape[-2:], mode="nearest")
         return (mask > 0.5).float()
 
-    def _loss_elementwise(pred, target):
-        if args.loss_type == "l2":
+    def _loss_elementwise(pred, target, loss_type):
+        if loss_type == "l2":
             return (pred - target) ** 2
         return torch.sqrt((pred - target) ** 2 + args.huber_c**2) - args.huber_c
 
-    def compute_mask_weighted_loss(pred, target, mask):
-        err = _loss_elementwise(pred, target)
+    def compute_mask_weighted_loss(pred, target, mask, text_weight=args.loss_text_weight, loss_type=args.loss_type):
+        err = _loss_elementwise(pred, target, loss_type)
         if mask is None:
             return err.mean(), None
         mask_lat = _normalize_text_mask(mask, pred.shape)
         if mask_lat is None:
             return err.mean(), None
         # Emphasize text regions in the main LCM consistency loss.
-        weight = 1.0 + (args.loss_text_weight - 1.0) * mask_lat
+        weight = 1.0 + (text_weight - 1.0) * mask_lat
         weighted = (err * weight).mean() / (weight.mean() + 1e-8)
         return weighted, mask_lat
 
@@ -901,28 +905,34 @@ def main():
 
                     _maybe_sync(timing_sync)
                     t0 = time.perf_counter()
-                    text_mask = get_text_mask(batch)
+                    text_mask = get_text_mask(
+                        cond_batch, mask_key=args.loss_mask_key, threshold=args.wm_thresh
+                    )
                     if text_mask is not None:
                         text_mask = text_mask.to(device, non_blocking=non_blocking)
-                    loss_base_raw = _loss_elementwise(model_pred.float(), target.float()).mean()
-                    loss_base, mask_lat = compute_mask_weighted_loss(
-                        model_pred.float(), target.float(), text_mask
+                    lcm_raw = _loss_elementwise(
+                        model_pred.float(), target.float(), args.loss_type
+                    ).mean()
+                    lcm_loss, mask_lat = compute_mask_weighted_loss(
+                        model_pred.float(),
+                        target.float(),
+                        text_mask,
+                        text_weight=args.loss_text_weight,
+                        loss_type=args.loss_type,
                     )
-                    loss = loss_base
-                    loss_teacher_x0 = loss_base.new_tensor(0.0)
+                    loss = lcm_loss
+                    loss_teacher_x0 = lcm_loss.new_tensor(0.0)
                     if args.loss_teacher_x0_weight > 0:
-                        if mask_lat is None:
-                            weight = None
-                        else:
-                            weight = 1.0 + (args.loss_text_weight - 1.0) * mask_lat
-                        l1_err = (student_pred_x0 - teacher_guided_pred_x0).abs()
-                        if weight is None:
-                            loss_teacher_x0 = l1_err.mean()
-                        else:
-                            loss_teacher_x0 = (l1_err * weight).mean() / (weight.mean() + 1e-8)
+                        loss_teacher_x0, _ = compute_mask_weighted_loss(
+                            student_pred_x0,
+                            teacher_guided_pred_x0.detach(),
+                            text_mask,
+                            text_weight=args.loss_text_weight,
+                            loss_type=args.loss_type,
+                        )
                         loss = loss + args.loss_teacher_x0_weight * loss_teacher_x0
-                    loss_ffl = loss_base.new_tensor(0.0)
-                    loss_grad = loss_base.new_tensor(0.0)
+                    loss_ffl = lcm_loss.new_tensor(0.0)
+                    loss_grad = lcm_loss.new_tensor(0.0)
                     if high_freq_loss is not None:
                         hf_total, hf_dict = high_freq_loss(teacher_guided_pred_x0, pred_x0_target, mask=text_mask)
                         loss = loss + hf_total
@@ -965,8 +975,8 @@ def main():
                 if args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     now = time.perf_counter()
                     loss_val = loss.detach().float().item()
-                    loss_base_val = loss_base.detach().float().item()
-                    loss_base_raw_val = loss_base_raw.detach().float().item()
+                    lcm_loss_val = lcm_loss.detach().float().item()
+                    lcm_raw_val = lcm_raw.detach().float().item()
                     mask_ratio = mask_lat.mean().detach().float().item() if mask_lat is not None else None
                     loss_teacher_x0_val = loss_teacher_x0.detach().float().item()
                     ffl_val = None
@@ -979,8 +989,8 @@ def main():
                     lr = optimizer.param_groups[0]["lr"]
                     postfix = {
                         "loss": f"{loss_val:.4f}",
-                        "lcm": f"{loss_base_val:.4f}",
-                        "lcm_raw": f"{loss_base_raw_val:.4f}",
+                        "lcm": f"{lcm_loss_val:.4f}",
+                        "lcm_raw": f"{lcm_raw_val:.4f}",
                         "ema": f"{ema_loss:.4f}",
                         "lr": f"{lr:.2e}",
                         "it/s": f"{it_s:.2f}",
@@ -1018,8 +1028,8 @@ def main():
                         {
                             "train/loss": loss_val,
                             "train/loss_ema": ema_loss,
-                            "train/lcm": loss_base_val,
-                            "train/lcm_raw": loss_base_raw_val,
+                            "train/lcm": lcm_loss_val,
+                            "train/lcm_raw": lcm_raw_val,
                             "train/mask_ratio": mask_ratio if mask_ratio is not None else 0.0,
                             "train/teacher_x0": loss_teacher_x0_val,
                             "train/lr": lr,
