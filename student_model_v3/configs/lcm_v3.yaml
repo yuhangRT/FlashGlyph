@@ -28,7 +28,7 @@ data:
 
 train:
   train_script: student_model_v3/train_lcm_anytext_v3.py
-  train_batch_size: 4
+  train_batch_size: 8
   gradient_accumulation_steps: 4
   learning_rate: 1e-4
   lr_scheduler: none
