@@ -42,10 +42,13 @@ train:
   lora_dropout: 0.0
   num_ddim_timesteps: 50
   num_inference_steps: 4
+  cfg_scale: 7.5
+  use_cfg: false
   w_min: 5.0
   w_max: 15.0
   loss_type: l2
   huber_c: 0.001
+  loss_teacher_x0_weight: 0.0
   logging_steps: 10
   log_image_steps: 500
   log_image_samples: 4
