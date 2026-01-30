@@ -1,8 +1,7 @@
 model:
   config: models_yaml/anytext2_sd15.yaml
   teacher_ckpt: models/anytext_v2.0.ckpt
-  output_dir: student_model_v3/checkpoints
-  # resume_path: student_model_v3/checkpoints/train_20260130_031859/checkpoint-2000
+  output_dir: student_model_v3/checkpoints/train_A1_maskLCM_x0
 
 data:
   cache_dir: dataset_cache/anytext2
@@ -29,13 +28,13 @@ data:
 
 train:
   train_script: student_model_v3/train_lcm_anytext_v3.py
-  train_batch_size: 4
-  gradient_accumulation_steps: 4
-  learning_rate: 1e-4
+  train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 5e-5
   lr_scheduler: none
   lr_warmup_steps: 0
   lr_min_ratio: 0.0
-  max_train_steps: 1000  # 50000
+  max_train_steps: 1000
   max_epochs: 0
   mixed_precision: fp16
   lora_rank: 64
@@ -49,11 +48,11 @@ train:
   w_max: 15.0
   loss_type: huber
   huber_c: 0.001
-  loss_mask_key: hint  # inv_mask
+  loss_mask_key: hint
   loss_text_weight: 5.0
   loss_teacher_x0_weight: 0.02
-  loss_ffl_weight: 0
-  loss_grad_weight: 0
+  loss_ffl_weight: 0.0
+  loss_grad_weight: 0.0
   ffl_alpha: 1.0
   ffl_patch_factor: 1
   ffl_ave_spectrum: false
@@ -65,7 +64,7 @@ train:
   log_image_infer_steps: 4
   timing_steps: 0
   timing_cuda_sync: false
-  save_steps: 2000
+  save_steps: 0
   num_workers: 4
   prefetch_factor: 4
   persistent_workers: true
@@ -78,4 +77,4 @@ train:
   seed: 42
 
 system:
-  notes: "LCM-LoRA distillation for AnyText2 v3 using v1.2b datasets."
+  notes: "A1: mask-weighted LCM + teacher-x0 (0.02), 1k steps."
