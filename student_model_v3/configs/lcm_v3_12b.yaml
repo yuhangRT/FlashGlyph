@@ -1,0 +1,81 @@
+model:
+  config: models_yaml/anytext2_sd15.yaml
+  teacher_ckpt: models/anytext_v2.0.ckpt
+  output_dir: student_model_v3/checkpoints
+  resume_path: student_model_v3/checkpoints/train_20260130_031859/checkpoint-2000
+
+data:
+  cache_dir: dataset_cache/anytext2
+  lmdb_path: dataset_cache/lmdb/anytext2_full
+  dataset_json:
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/Art/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/COCO_Text/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/icdar2017rctw/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/LSVT/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/mlt2019/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/MTWI2018/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/ocr_data/ReCTS/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/laion_word/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_1of5/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_2of5/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_3of5/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_4of5/data_v1.2b.json
+    - dataset/anytext2_json_files/anytext2_json_files/wukong_word/wukong_5of5/data_v1.2b.json
+  resolution: 512
+  wm_thresh: 1.0
+  streaming: true
+  streaming_threshold_mb: 200
+  font_hint_randaug: false
+
+train:
+  train_script: student_model_v3/train_lcm_anytext_v3.py
+  train_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-4
+  lr_scheduler: none
+  lr_warmup_steps: 0
+  lr_min_ratio: 0.0
+  max_train_steps: 50000
+  max_epochs: 0
+  mixed_precision: fp16
+  lora_rank: 64
+  lora_alpha: 64
+  lora_dropout: 0.0
+  num_ddim_timesteps: 50
+  num_inference_steps: 4
+  cfg_scale: 7.5
+  use_cfg: false
+  w_min: 5.0
+  w_max: 15.0
+  loss_type: huber
+  huber_c: 0.001
+  loss_mask_key: inv_mask
+  loss_text_weight: 5.0
+  loss_teacher_x0_weight: 0.0
+  loss_ffl_weight: 0.05
+  loss_grad_weight: 0.05
+  ffl_alpha: 1.0
+  ffl_patch_factor: 1
+  ffl_ave_spectrum: false
+  ffl_log_matrix: false
+  ffl_batch_matrix: false
+  logging_steps: 10
+  log_image_steps: 500
+  log_image_samples: 4
+  log_image_infer_steps: 4
+  timing_steps: 0
+  timing_cuda_sync: false
+  save_steps: 2000
+  num_workers: 4
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+  worker_num_threads: 1
+  cv2_num_threads: 1
+  allow_tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  seed: 42
+
+system:
+  notes: "LCM-LoRA distillation for AnyText2 v3 using v1.2b datasets."

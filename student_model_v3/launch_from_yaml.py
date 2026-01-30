@@ -1,7 +1,6 @@
 import argparse
 import importlib
 import sys
-from datetime import datetime
 from pathlib import Path
 
 repo_root = Path(__file__).resolve().parent.parent
@@ -46,11 +45,10 @@ def build_args(config):
         "pin_memory",
         "allow_tf32",
         "cudnn_benchmark",
-        "resume_optimizer",
         "ffl_ave_spectrum",
         "ffl_log_matrix",
         "ffl_batch_matrix",
-        "target_from_teacher",
+        "cast_teacher_unet",
     }
 
     for key, value in config.items():
@@ -76,50 +74,6 @@ def build_args(config):
     return args
 
 
-def expand_paths(paths, repo_root):
-    expanded = []
-    for entry in paths:
-        for part in str(entry).split(","):
-            part = part.strip()
-            if not part:
-                continue
-            p = Path(part)
-            if not p.is_absolute():
-                p = (repo_root / p).resolve()
-            if p.suffix in {".list", ".txt"}:
-                with p.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        path_line = Path(line)
-                        if not path_line.is_absolute():
-                            path_line = (repo_root / path_line).resolve()
-                        expanded.append(str(path_line))
-            else:
-                expanded.append(str(p))
-    return expanded
-
-
-def prepare_cache(config):
-    from student_model_v2.dataset_anytext_v2 import JsonlIndex
-
-    dataset_json = config.get("dataset_json", [])
-    if not dataset_json:
-        return
-    json_paths = expand_paths(dataset_json, repo_root)
-    wm_thresh = float(config.get("wm_thresh", 1.0))
-    streaming_threshold_mb = int(config.get("streaming_threshold_mb", 200))
-    cache_dir = config.get("cache_dir") or None
-    for path in json_paths:
-        JsonlIndex(
-            json_path=path,
-            wm_thresh=wm_thresh,
-            force_streaming=True,
-            threshold_mb=streaming_threshold_mb,
-            cache_dir=cache_dir,
-        )
-
 def normalize_train_script(entry, repo_root):
     entry = str(entry).strip()
     if not entry:
@@ -136,27 +90,14 @@ def normalize_train_script(entry, repo_root):
     return entry
 
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Launch LCM training from YAML config")
+    parser = argparse.ArgumentParser(description="Launch LCM training from YAML config (v3)")
     parser.add_argument("--config", required=True, help="Path to YAML config file.")
     parser.add_argument("--print_args", action="store_true", help="Only print parsed arguments.")
-    parser.add_argument("--prepare_cache", action="store_true", help="Only build streaming cache files.")
     args = parser.parse_args()
 
     cfg = merge_config(load_yaml(args.config))
     train_script = str(cfg.pop("train_script", "")).strip()
-    if args.prepare_cache:
-        prepare_cache(cfg)
-        return
-    use_optimized = bool(cfg.pop("use_optimized", False))
-    add_time_suffix = bool(cfg.pop("add_time_suffix", False))
-    resume_path = cfg.get("resume_path")
-    if not resume_path:
-        output_dir = cfg.get("output_dir")
-        if output_dir and add_time_suffix:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            cfg["output_dir"] = str(Path(output_dir) / f"train_{timestamp}")
     cli_args = build_args(cfg)
     if args.print_args:
         print(" ".join(cli_args))
@@ -166,10 +107,8 @@ def main():
     if train_script:
         module_name = normalize_train_script(train_script, repo_root)
         train_main = importlib.import_module(module_name).main
-    elif use_optimized:
-        from student_model_v2.train_lcm_anytext_v2_2 import main as train_main
     else:
-        from student_model_v2.train_lcm_anytext_v2 import main as train_main
+        from student_model_v3.train_lcm_anytext_v3 import main as train_main
 
     train_main()
 

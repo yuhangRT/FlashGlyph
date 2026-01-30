@@ -6,12 +6,8 @@ python3 student_model_v3/launch_single_gpu.py --config student_model_v3/configs/
 python3 student_model_v3/launch_single_gpu.py --config student_model_v3/configs/lcm_v3.yaml --gpu 0 --min-available-gb 4
 
 
-## multiLoss的版本
-使用 lcm_v3_gl.yaml 进行训练。  
-```
-
-```
-
+### 续训
+在yaml文件的model中，添加 resume_path
 
 # 利用student模型推理
 

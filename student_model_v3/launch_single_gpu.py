@@ -15,14 +15,12 @@ def _validate_gpu_id(gpu_id):
 
 def _build_train_command(config_path, print_args, prepare_cache):
     repo_root = Path(__file__).resolve().parent.parent
-    launcher = repo_root / "student_model_v2" / "launch_from_yaml.py"
+    launcher = repo_root / "student_model_v3" / "launch_from_yaml.py"
     if not launcher.exists():
         raise FileNotFoundError(f"Missing launcher: {launcher}")
     cmd = [sys.executable, str(launcher), "--config", str(config_path)]
     if print_args:
         cmd.append("--print_args")
-    if prepare_cache:
-        cmd.append("--prepare_cache")
     return cmd
 
 
@@ -47,7 +45,7 @@ def main():
     parser = argparse.ArgumentParser(description="Single-GPU launcher with optional RAM OOM guard.")
     parser.add_argument("--config", required=True, help="Path to v3 YAML config.")
     parser.add_argument("--gpu", default="0", help="Single GPU id (default: 0).")
-    parser.add_argument("--min-available-gb", type=float, default=6.0)
+    parser.add_argument("--min-available-gb", type=float, default=3.0)
     parser.add_argument("--check-interval", type=float, default=5.0)
     parser.add_argument("--kill-timeout", type=float, default=30.0)
     parser.add_argument("--print_args", action="store_true")

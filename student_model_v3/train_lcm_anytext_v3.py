@@ -481,19 +481,6 @@ def main():
     except Exception:
         pass
 
-    accelerator = Accelerator(
-        mixed_precision=args.mixed_precision,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        log_with="tensorboard",
-        project_dir=os.path.join(args.output_dir, "logs"),
-    )
-    set_seed(args.seed)
-    if accelerator.num_processes != 1:
-        raise RuntimeError(
-            "This v3 training script is single-GPU only. "
-            "Run without multi-GPU accelerate and set CUDA_VISIBLE_DEVICES to a single GPU."
-        )
-
     run_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir)
     if output_dir.name.startswith("train_"):
@@ -501,6 +488,20 @@ def main():
     else:
         run_dir = output_dir / f"train_{run_suffix}"
     args.output_dir = str(run_dir)
+
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        log_with="tensorboard",
+        project_dir=os.path.join(args.output_dir, "logs"),
+    )
+    set_seed(args.seed)
+    # 禁止多GPU训练
+    # if accelerator.num_processes != 1:
+    #     raise RuntimeError(
+    #         "This v3 training script is single-GPU only. "
+    #         "Run without multi-GPU accelerate and set CUDA_VISIBLE_DEVICES to a single GPU."
+    #     )
 
     config_path = Path(args.config)
     ckpt_path = Path(args.teacher_ckpt)
