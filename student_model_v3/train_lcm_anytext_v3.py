@@ -212,17 +212,23 @@ def _to_01(tensor, assume_neg1_pos1):
     return tensor.clamp(0.0, 1.0)
 
 
-def make_preview_grid(img, masked_img, hint, pred_img, max_samples=4):
+def make_preview_grid(img, masked_img, hint, pred_img, teacher_img=None, max_samples=4):
     img = _expand_to_rgb(_to_01(_ensure_nchw(img), assume_neg1_pos1=True))
     masked_img = _expand_to_rgb(_to_01(_ensure_nchw(masked_img), assume_neg1_pos1=True))
     hint = _expand_to_rgb(_to_01(_ensure_nchw(hint), assume_neg1_pos1=False))
     pred_img = _expand_to_rgb(_to_01(_ensure_nchw(pred_img), assume_neg1_pos1=True))
+    teacher_img = _expand_to_rgb(_to_01(_ensure_nchw(teacher_img), assume_neg1_pos1=True)) if teacher_img is not None else None
 
     n = min(max_samples, img.shape[0], masked_img.shape[0], hint.shape[0], pred_img.shape[0])
+    if teacher_img is not None:
+        n = min(n, teacher_img.shape[0])
     tiles = []
     for i in range(n):
-        tiles.extend([img[i], masked_img[i], hint[i], pred_img[i]])
-    grid = torchvision.utils.make_grid(torch.stack(tiles), nrow=4)
+        if teacher_img is None:
+            tiles.extend([img[i], masked_img[i], hint[i], pred_img[i]])
+        else:
+            tiles.extend([img[i], masked_img[i], hint[i], teacher_img[i], pred_img[i]])
+    grid = torchvision.utils.make_grid(torch.stack(tiles), nrow=5 if teacher_img is not None else 4)
     return grid
 
 
@@ -230,9 +236,11 @@ def log_train_images_infer(
     step,
     batch,
     wrapper,
+    teacher_wrapper,
     output_dir,
     max_samples,
     num_inference_steps,
+    teacher_infer_steps,
     cfg_scale,
     use_cfg,
     alphas_cumprod,
@@ -248,6 +256,8 @@ def log_train_images_infer(
     batch = _slice_batch_for_log(batch, max_samples)
     was_training = wrapper.base_model.training
     wrapper.base_model.eval()
+    teacher_was_training = teacher_wrapper.base_model.training
+    teacher_wrapper.base_model.eval()
     try:
         with torch.no_grad():
             with autocast_context():
@@ -263,33 +273,37 @@ def log_train_images_infer(
                 latent_shape = batch["masked_x"].shape[1:]
                 dtype = next(wrapper.base_model.parameters()).dtype
 
-                latents = torch.randn((batch_size, *latent_shape), device=device, dtype=dtype)
-                schedule = make_lcm_schedule(
-                    num_inference_steps, num_train_timesteps=alphas_cumprod.shape[0]
-                )
                 use_cfg = use_cfg or cfg_scale > 1.0
-                for i, t in enumerate(schedule):
-                    ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
-                    if use_cfg:
-                        # CFG for visualization: combine cond/uncond predictions.
-                        eps_cond = wrapper.forward(latents, ts, text_emb, text_info, hint)
-                        eps_uncond = wrapper.forward(latents, ts, uncond_text_emb, uncond_text_info, hint)
-                        model_output = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
-                    else:
-                        model_output = wrapper.forward(latents, ts, text_emb, text_info, hint)
-                    eps = predict_eps_from_model_output(
-                        latents, ts, model_output, alphas_cumprod, parameterization
+                def _sample(wrapper_model, steps):
+                    latents = torch.randn((batch_size, *latent_shape), device=device, dtype=dtype)
+                    schedule = make_lcm_schedule(
+                        steps, num_train_timesteps=alphas_cumprod.shape[0]
                     )
-                    t_prev = schedule[i + 1] if i + 1 < len(schedule) else 0
-                    t_prev_tensor = torch.full((batch_size,), t_prev, device=device, dtype=torch.long)
-                    latents = ddim_step(latents, ts, t_prev_tensor, eps, alphas_cumprod)
+                    for i, t in enumerate(schedule):
+                        ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
+                        if use_cfg:
+                            # CFG for visualization: combine cond/uncond predictions.
+                            eps_cond = wrapper_model.forward(latents, ts, text_emb, text_info, hint)
+                            eps_uncond = wrapper_model.forward(latents, ts, uncond_text_emb, uncond_text_info, hint)
+                            model_output = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+                        else:
+                            model_output = wrapper_model.forward(latents, ts, text_emb, text_info, hint)
+                        eps = predict_eps_from_model_output(
+                            latents, ts, model_output, alphas_cumprod, parameterization
+                        )
+                        t_prev = schedule[i + 1] if i + 1 < len(schedule) else 0
+                        t_prev_tensor = torch.full((batch_size,), t_prev, device=device, dtype=torch.long)
+                        latents = ddim_step(latents, ts, t_prev_tensor, eps, alphas_cumprod)
+                    return wrapper_model.base_model.decode_first_stage(latents)
 
-                pred_img = wrapper.base_model.decode_first_stage(latents)
+                teacher_img = _sample(teacher_wrapper, teacher_infer_steps)
+                pred_img = _sample(wrapper, num_inference_steps)
         grid = make_preview_grid(
             batch["img"],
             batch["masked_img"],
             batch["hint"],
             pred_img,
+            teacher_img,
             max_samples=max_samples,
         )
         out_path = out_dir / f"step_{step:07d}.png"
@@ -298,6 +312,8 @@ def log_train_images_infer(
     finally:
         if was_training:
             wrapper.base_model.train()
+        if teacher_was_training:
+            teacher_wrapper.base_model.train()
 
 
 def get_prediction_type(base_model):
@@ -1056,9 +1072,11 @@ def main():
                             global_step,
                             batch,
                             student_wrapper,
+                            teacher_wrapper,
                             log_image_dir,
                             max_samples=args.log_image_samples,
                             num_inference_steps=args.log_image_infer_steps,
+                            teacher_infer_steps=args.num_ddim_timesteps,
                             cfg_scale=args.cfg_scale,
                             use_cfg=args.use_cfg,
                             alphas_cumprod=alphas_cumprod,

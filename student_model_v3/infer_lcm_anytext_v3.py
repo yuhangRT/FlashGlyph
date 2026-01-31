@@ -1,4 +1,6 @@
 import argparse
+import random
+import time
 from pathlib import Path
 
 import torch
@@ -135,17 +137,25 @@ def _to_01(tensor, assume_neg1_pos1):
     return tensor.clamp(0.0, 1.0)
 
 
-def make_preview_grid(img, masked_img, hint, pred_img, max_samples=4):
+def make_preview_grid(img, masked_img, hint, teacher_img, pred_img, max_samples=4):
     img = _expand_to_rgb(_to_01(_ensure_nchw(img), assume_neg1_pos1=True))
     masked_img = _expand_to_rgb(_to_01(_ensure_nchw(masked_img), assume_neg1_pos1=True))
     hint = _expand_to_rgb(_to_01(_ensure_nchw(hint), assume_neg1_pos1=False))
+    teacher_img = _expand_to_rgb(_to_01(_ensure_nchw(teacher_img), assume_neg1_pos1=True))
     pred_img = _expand_to_rgb(_to_01(_ensure_nchw(pred_img), assume_neg1_pos1=True))
 
-    n = min(max_samples, img.shape[0], masked_img.shape[0], hint.shape[0], pred_img.shape[0])
+    n = min(
+        max_samples,
+        img.shape[0],
+        masked_img.shape[0],
+        hint.shape[0],
+        teacher_img.shape[0],
+        pred_img.shape[0],
+    )
     tiles = []
     for i in range(n):
-        tiles.extend([img[i], masked_img[i], hint[i], pred_img[i]])
-    grid = torchvision.utils.make_grid(torch.stack(tiles), nrow=4)
+        tiles.extend([img[i], masked_img[i], hint[i], teacher_img[i], pred_img[i]])
+    grid = torchvision.utils.make_grid(torch.stack(tiles), nrow=5)
     return grid
 
 
@@ -158,8 +168,10 @@ def main():
     parser.add_argument("--lmdb_path", type=str, default="")
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--num_inference_steps", type=int, default=4)
+    parser.add_argument("--teacher_inference_steps", type=int, default=50)
     parser.add_argument("--max_samples", type=int, default=4)
-    parser.add_argument("--output", type=str, default="student_model_v3/preview.png")
+    parser.add_argument("--sample_seed", type=int, default=42)
+    parser.add_argument("--output", type=str, default="")
     parser.add_argument("--cfg_scale", type=float, default=7.5)
     parser.add_argument("--use_cfg", action="store_true", default=False)
     args = parser.parse_args()
@@ -171,9 +183,12 @@ def main():
     if not ckpt_path.is_absolute():
         ckpt_path = (Path(__file__).parent.parent / ckpt_path).resolve()
 
-    model = create_model(str(config_path))
+    teacher_model = create_model(str(config_path))
     state_dict = load_state_dict(str(ckpt_path), location="cpu")
-    model.load_state_dict(state_dict, strict=False)
+    teacher_model.load_state_dict(state_dict, strict=False)
+
+    student_model = create_model(str(config_path))
+    student_model.load_state_dict(state_dict, strict=False)
 
     if args.student_lora_path:
         from peft import PeftModel
@@ -183,67 +198,95 @@ def main():
                 f"Can't find 'adapter_config.json' at '{lora_path}'. "
                 "Pass a specific checkpoint directory or the checkpoints root."
             )
-        model = PeftModel.from_pretrained(model, str(lora_path), is_trainable=False)
+        student_model = PeftModel.from_pretrained(student_model, str(lora_path), is_trainable=False)
+    else:
+        lora_path = None
 
-    model.eval()
+    teacher_model.eval()
+    student_model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    wrapper = AnyText2ForwardWrapper(model, device)
+    teacher_wrapper = AnyText2ForwardWrapper(teacher_model, device)
+    student_wrapper = AnyText2ForwardWrapper(student_model, device)
 
     dataset = RealAnyTextDataset(
         json_path=args.dataset_json[0],
         resolution=args.resolution,
         lmdb_path=args.lmdb_path or None,
     )
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=args.max_samples,
-        shuffle=False,
-        collate_fn=collate_fn_anytext,
-    )
-
-    batch = next(iter(loader))
-    encode_img_and_masked_x(batch, wrapper, device)
+    rng = random.Random(args.sample_seed)
+    total = len(dataset)
+    if total <= 0:
+        raise RuntimeError("Dataset is empty.")
+    indices = [rng.randrange(total) for _ in range(args.max_samples)]
+    samples = [dataset[i] for i in indices]
+    batch = collate_fn_anytext(samples)
+    encode_img_and_masked_x(batch, student_wrapper, device)
     cond_batch = build_cond_batch(batch, device)
     uncond_batch = build_uncond_batch(cond_batch)
 
-    text_info = wrapper.prepare_text_info(cond_batch)
-    text_emb = wrapper.encode_text(cond_batch, text_info)
-    uncond_text_info = wrapper.prepare_text_info(uncond_batch)
-    uncond_text_emb = wrapper.encode_text(uncond_batch, uncond_text_info)
+    text_info = student_wrapper.prepare_text_info(cond_batch)
+    text_emb = student_wrapper.encode_text(cond_batch, text_info)
+    uncond_text_info = student_wrapper.prepare_text_info(uncond_batch)
+    uncond_text_emb = student_wrapper.encode_text(uncond_batch, uncond_text_info)
     hint = cond_batch["hint"]
 
-    alphas_cumprod = wrapper.base_model.alphas_cumprod.to(device)
-    parameterization = getattr(wrapper.base_model, "parameterization", "eps")
+    alphas_cumprod = student_wrapper.base_model.alphas_cumprod.to(device)
+    parameterization = getattr(student_wrapper.base_model, "parameterization", "eps")
 
     batch_size = hint.shape[0]
     latent_shape = cond_batch["masked_x"].shape[1:]
-    dtype = next(wrapper.base_model.parameters()).dtype
+    dtype = next(student_wrapper.base_model.parameters()).dtype
 
-    latents = torch.randn((batch_size, *latent_shape), device=device, dtype=dtype)
-    schedule = make_lcm_schedule(args.num_inference_steps, num_train_timesteps=alphas_cumprod.shape[0])
     use_cfg = args.use_cfg or args.cfg_scale > 1.0
-    for i, t in enumerate(schedule):
-        ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
-        if use_cfg:
-            # CFG: combine cond/uncond outputs to strengthen text adherence.
-            eps_cond = wrapper.forward(latents, ts, text_emb, text_info, hint)
-            eps_uncond = wrapper.forward(latents, ts, uncond_text_emb, uncond_text_info, hint)
-            model_output = eps_uncond + args.cfg_scale * (eps_cond - eps_uncond)
+    def _sample(wrapper, steps):
+        latents = torch.randn((batch_size, *latent_shape), device=device, dtype=dtype)
+        schedule = make_lcm_schedule(steps, num_train_timesteps=alphas_cumprod.shape[0])
+        for i, t in enumerate(schedule):
+            ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            if use_cfg:
+                eps_cond = wrapper.forward(latents, ts, text_emb, text_info, hint)
+                eps_uncond = wrapper.forward(latents, ts, uncond_text_emb, uncond_text_info, hint)
+                model_output = eps_uncond + args.cfg_scale * (eps_cond - eps_uncond)
+            else:
+                model_output = wrapper.forward(latents, ts, text_emb, text_info, hint)
+            eps = predict_eps_from_model_output(latents, ts, model_output, alphas_cumprod, parameterization)
+            t_prev = schedule[i + 1] if i + 1 < len(schedule) else 0
+            t_prev_tensor = torch.full((batch_size,), t_prev, device=device, dtype=torch.long)
+            latents = ddim_step(latents, ts, t_prev_tensor, eps, alphas_cumprod)
+        return wrapper.base_model.decode_first_stage(latents)
+
+    teacher_img = _sample(teacher_wrapper, args.teacher_inference_steps)
+    pred_img = _sample(student_wrapper, args.num_inference_steps)
+
+    grid = make_preview_grid(
+        batch["img"],
+        batch["masked_img"],
+        batch["hint"],
+        teacher_img,
+        pred_img,
+        max_samples=args.max_samples,
+    )
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        if lora_path is not None:
+            lora_path = Path(lora_path)
+            if lora_path.name.startswith("checkpoint"):
+                run_dir = lora_path.parent
+            else:
+                run_dir = lora_path
         else:
-            model_output = wrapper.forward(latents, ts, text_emb, text_info, hint)
-        eps = predict_eps_from_model_output(latents, ts, model_output, alphas_cumprod, parameterization)
-        t_prev = schedule[i + 1] if i + 1 < len(schedule) else 0
-        t_prev_tensor = torch.full((batch_size,), t_prev, device=device, dtype=torch.long)
-        latents = ddim_step(latents, ts, t_prev_tensor, eps, alphas_cumprod)
-
-    with torch.no_grad():
-        pred_img = wrapper.base_model.decode_first_stage(latents)
-
-    grid = make_preview_grid(batch["img"], batch["masked_img"], batch["hint"], pred_img, max_samples=args.max_samples)
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torchvision.utils.save_image(grid, out_path)
-    print(f"Saved preview to {out_path}")
+            run_dir = Path("student_model_v3")
+        out_path = run_dir / "inter_img"
+    if out_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+        out_file = out_path
+    else:
+        out_file = out_path / f"preview_{timestamp}.png"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    torchvision.utils.save_image(grid, out_file)
+    print(f"Saved preview to {out_file}")
 
 
 if __name__ == "__main__":
