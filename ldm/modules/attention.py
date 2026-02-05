@@ -9,6 +9,7 @@ from typing import Optional, Any
 from ldm.modules.diffusionmodules.util import checkpoint
 
 
+import os
 try:
     import xformers
     import xformers.ops
@@ -16,8 +17,10 @@ try:
 except:
     XFORMERS_IS_AVAILBLE = False
 
+if os.environ.get("DISABLE_XFORMERS", "0") == "1":
+    XFORMERS_IS_AVAILBLE = False
+
 # CrossAttn precision handling
-import os
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
 def exists(val):
@@ -159,6 +162,63 @@ class CrossAttention(nn.Module):
             nn.Linear(inner_dim, query_dim),
             nn.Dropout(dropout)
         )
+        self._record_attn = False
+        self._token_mask_spec = None
+        self._last_mass = None
+        self._attn_hw_allowlist = None
+
+    def _build_token_mask(self, batch_size, context_len, device, dtype):
+        spec = self._token_mask_spec or {}
+        img_mask = spec.get("img_mask")
+        text_mask = spec.get("text_mask")
+        align = spec.get("align", "concat")
+
+        def _normalize_mask(mask):
+            if mask is None:
+                return torch.zeros((batch_size, 0), device=device, dtype=dtype)
+            mask = mask.to(device=device, dtype=dtype)
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            if mask.shape[0] == 1 and batch_size > 1:
+                mask = mask.expand(batch_size, -1)
+            if mask.shape[0] < batch_size:
+                pad = torch.zeros((batch_size - mask.shape[0], mask.shape[1]), device=device, dtype=dtype)
+                mask = torch.cat([mask, pad], dim=0)
+            elif mask.shape[0] > batch_size:
+                mask = mask[:batch_size]
+            return mask
+
+        img_mask = _normalize_mask(img_mask)
+        text_mask = _normalize_mask(text_mask)
+        base = torch.cat([img_mask, text_mask], dim=1)
+        if align == "concat" and base.shape[1] == context_len:
+            mask = base
+        else:
+            if base.shape[1] >= context_len:
+                mask = base[:, :context_len]
+            else:
+                pad = torch.zeros((batch_size, context_len - base.shape[1]), device=device, dtype=dtype)
+                mask = torch.cat([base, pad], dim=1)
+        return mask
+
+    def _compute_attn_mass(self, sim, heads):
+        if self._token_mask_spec is None:
+            return None
+        if self._attn_hw_allowlist:
+            query_len = sim.shape[1]
+            sqrt_len = int(math.sqrt(query_len))
+            if sqrt_len * sqrt_len != query_len or sqrt_len not in self._attn_hw_allowlist:
+                return None
+        batch_size = sim.shape[0] // heads
+        context_len = sim.shape[-1]
+        mask = self._build_token_mask(batch_size, context_len, sim.device, sim.dtype)
+        if mask.numel() == 0:
+            return None
+        mask = mask.unsqueeze(1)
+        mask = mask.repeat_interleave(heads, dim=0)
+        mass = (sim * mask).sum(dim=-1)
+        mass = mass.view(batch_size, heads, -1).mean(dim=1)
+        return mass
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
@@ -190,6 +250,13 @@ class CrossAttention(nn.Module):
 
         # attention, what we cannot get enough of
         sim = sim.softmax(dim=-1)
+
+        self._last_mass = None
+        if self._record_attn and self._token_mask_spec is not None:
+            try:
+                self._last_mass = self._compute_attn_mass(sim, h)
+            except Exception:
+                self._last_mass = None
 
         out = einsum('b i j, b j d -> b i d', sim, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
@@ -351,4 +418,3 @@ class SpatialTransformer(nn.Module):
         if not self.use_linear:
             x = self.proj_out(x)
         return x + x_in
-

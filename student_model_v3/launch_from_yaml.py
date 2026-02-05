@@ -37,7 +37,7 @@ def merge_config(cfg):
 
 def build_args(config):
     args = []
-    list_keys = {"dataset_json"}
+    list_keys = {"dataset_json", "attn_hw_allowlist"}
     bool_keys = {
         "use_mock_dataset",
         "use_cfg",
@@ -97,6 +97,10 @@ def main():
     args = parser.parse_args()
 
     cfg = merge_config(load_yaml(args.config))
+    if cfg.get("disable_xformers", False) or cfg.get("loss_attn_weight", 0) > 0:
+        import os
+        os.environ.setdefault("DISABLE_XFORMERS", "1")
+    cfg.pop("disable_xformers", None)
     train_script = str(cfg.pop("train_script", "")).strip()
     cli_args = build_args(cfg)
     if args.print_args:

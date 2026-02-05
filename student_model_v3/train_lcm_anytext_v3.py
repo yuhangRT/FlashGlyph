@@ -42,6 +42,13 @@ from student_model_v3.lcm_solver import (
 )
 from student_model_v3.wrappers import AnyText2ForwardWrapper
 from student_model_v3.losses import HighFreqTextLoss
+from student_model_v3.attn_distill import (
+    collect_attn_modules,
+    gather_attn_mass,
+    resolve_unet_for_attn,
+    set_attn_recording,
+)
+from student_model_v3.topology_loss import cldice_loss
 
 
 def _worker_init_fn(worker_threads, cv2_threads, _):
@@ -64,12 +71,14 @@ def disable_checkpointing(model):
             module.use_checkpoint = False
 
 
-def build_lora_target_modules(model):
+def build_lora_target_modules(model, include_fuse_block=False):
     target_modules = []
     for name, module in model.named_modules():
         if not (name.startswith("model.diffusion_model") or name.startswith("control_model")):
             continue
-        if any(skip in name for skip in ["glyph_block", "position_block", "fuse_block_za"]):
+        if any(skip in name for skip in ["glyph_block", "position_block"]):
+            continue
+        if "fuse_block_za" in name and not include_fuse_block:
             continue
         is_linear = isinstance(module, torch.nn.Linear)
         is_conv2d = isinstance(module, torch.nn.Conv2d)
@@ -81,6 +90,8 @@ def build_lora_target_modules(model):
         if "zero_convs" in name and is_conv2d:
             target_modules.append(name)
             continue
+        if include_fuse_block and "fuse_block_za" in name and is_conv2d:
+            target_modules.append(name)
 
     target_modules = sorted(set(target_modules))
     return target_modules
@@ -197,6 +208,140 @@ def _slice_batch_for_log(batch, max_samples):
         else:
             sliced[key] = value
     return sliced
+
+
+def _build_placeholder_mask(text_captions, tokenizer, placeholder_token, max_length, device):
+    if tokenizer is None or placeholder_token is None:
+        return torch.zeros((len(text_captions), max_length), device=device)
+    try:
+        placeholder_token = int(placeholder_token)
+    except Exception:
+        placeholder_token = int(placeholder_token.item()) if hasattr(placeholder_token, "item") else None
+    if placeholder_token is None:
+        return torch.zeros((len(text_captions), max_length), device=device)
+    tokens = tokenizer(
+        text_captions,
+        truncation=True,
+        max_length=max_length,
+        return_overflowing_tokens=False,
+        padding="max_length",
+        return_tensors="pt",
+    )["input_ids"]
+    tokens = tokens.to(device)
+    return (tokens == placeholder_token).float()
+
+
+def _compute_attn_gate_mask(start_timesteps, sigma_schedule, gate_mode, sigma_min, sigma_max, t_min, t_max):
+    if gate_mode == "sigma":
+        sigma = extract_into_tensor(sigma_schedule, start_timesteps, (start_timesteps.shape[0], 1))
+        sigma = sigma.view(-1)
+        return (sigma >= sigma_min) & (sigma <= sigma_max)
+    return (start_timesteps >= t_min) & (start_timesteps <= t_max)
+
+
+def _normalize_text_mask(mask, target_shape):
+    if mask is None:
+        return None
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    if mask.dim() == 4 and mask.shape[1] > 1:
+        mask = mask.max(dim=1, keepdim=True).values
+    if mask.shape[-2:] != target_shape[-2:]:
+        mask = F.interpolate(mask, size=target_shape[-2:], mode="nearest")
+    return (mask > 0.5).float()
+
+
+def _compute_attn_loss(student_masses, teacher_masses, text_mask, eps=1e-6):
+    if not student_masses or not teacher_masses:
+        return None
+    losses = []
+    for sm, tm in zip(student_masses, teacher_masses):
+        if sm is None or tm is None:
+            continue
+        if sm.shape != tm.shape:
+            continue
+        bsz, n = sm.shape
+        side = int(math.sqrt(n))
+        if side * side != n:
+            continue
+        sm_map = sm.view(bsz, 1, side, side)
+        tm_map = tm.view(bsz, 1, side, side)
+        mask = _normalize_text_mask(text_mask, sm_map.shape) if text_mask is not None else None
+        if mask is None or mask.sum() <= 0:
+            continue
+        sm_map = sm_map * mask
+        tm_map = tm_map * mask
+        sm_flat = sm_map.view(bsz, -1)
+        tm_flat = tm_map.view(bsz, -1)
+        sm_norm = sm_flat / (sm_flat.sum(dim=1, keepdim=True) + eps)
+        tm_norm = tm_flat / (tm_flat.sum(dim=1, keepdim=True) + eps)
+        kl = tm_norm * (tm_norm.add(eps).log() - sm_norm.add(eps).log())
+        losses.append(kl.sum(dim=1).mean())
+    if not losses:
+        return None
+    return torch.stack(losses).mean()
+
+
+def _bbox_from_mask(mask):
+    coords = mask.nonzero(as_tuple=False)
+    if coords.numel() == 0:
+        return None
+    ys = coords[:, 0]
+    xs = coords[:, 1]
+    y1 = int(ys.min().item())
+    y2 = int(ys.max().item()) + 1
+    x1 = int(xs.min().item())
+    x2 = int(xs.max().item()) + 1
+    if y2 <= y1 or x2 <= x1:
+        return None
+    return x1, y1, x2, y2
+
+
+def _extract_text_crops(pred_img, positions, n_lines, texts, target_hw=(48, 320)):
+    crops = []
+    gt_texts = []
+    bsz = pred_img.shape[0]
+    for i in range(bsz):
+        lines = int(n_lines[i].item())
+        for j in range(lines):
+            text = texts[j][i]
+            if not text or text.strip() == "":
+                continue
+            pos_mask = positions[j][i]
+            if pos_mask.dim() == 3:
+                pos_mask = pos_mask[0]
+            pos_mask_cpu = pos_mask.detach().cpu()
+            bbox = _bbox_from_mask(pos_mask_cpu > 0.5)
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = bbox
+            crop = pred_img[i, :, y1:y2, x1:x2]
+            if crop.numel() == 0:
+                continue
+            crop = F.interpolate(crop.unsqueeze(0), size=target_hw, mode="bilinear", align_corners=True)[0]
+            crops.append(crop)
+            gt_texts.append(text)
+    return crops, gt_texts
+
+
+def _compute_stroke_tau(diff, mask, default_tau, quantile=0.6):
+    bsz = diff.shape[0]
+    tau = diff.new_full((bsz, 1, 1, 1), float(default_tau))
+    diff_detached = diff.detach()
+    mask_detached = mask.detach() if mask is not None else None
+    for i in range(bsz):
+        if mask_detached is None:
+            valid = diff_detached[i].flatten()
+        else:
+            valid = diff_detached[i][mask_detached[i] > 0.5]
+        valid = valid[torch.isfinite(valid)]
+        if valid.numel() == 0:
+            continue
+        q = torch.quantile(valid, quantile)
+        if torch.isfinite(q):
+            tau[i] = q
+    tau = torch.nan_to_num(tau, nan=default_tau, posinf=default_tau, neginf=default_tau)
+    return tau
 
 
 def _expand_to_rgb(tensor):
@@ -440,6 +585,7 @@ def main():
     parser.add_argument("--loss_type", type=str, default="l2", choices=["l2", "huber"])
     parser.add_argument("--huber_c", type=float, default=0.001)
     parser.add_argument("--loss_teacher_x0_weight", type=float, default=0.0)
+    parser.add_argument("--loss_attn_weight", type=float, default=0.0)
     parser.add_argument("--loss_ffl_weight", type=float, default=0.0)
     parser.add_argument("--loss_grad_weight", type=float, default=0.0)
     parser.add_argument("--ffl_alpha", type=float, default=1.0)
@@ -449,6 +595,21 @@ def main():
     parser.add_argument("--ffl_batch_matrix", action="store_true", default=False)
     parser.add_argument("--loss_mask_key", type=str, default="inv_mask", choices=["hint", "positions", "inv_mask"])
     parser.add_argument("--loss_text_weight", type=float, default=5.0)
+    parser.add_argument("--loss_ocr_weight", type=float, default=0.0)
+    parser.add_argument("--ocr_every", type=int, default=8)
+    parser.add_argument("--loss_cldice_weight", type=float, default=0.0)
+    parser.add_argument("--cldice_iters", type=int, default=10)
+    parser.add_argument("--stroke_tau", type=float, default=-1.0)
+    parser.add_argument("--stroke_k", type=float, default=12.0)
+    parser.add_argument("--attn_every", type=int, default=4)
+    parser.add_argument("--attn_hw_allowlist", type=int, nargs="+", default=[32, 64])
+    parser.add_argument("--attn_sigma_min", type=float, default=0.2)
+    parser.add_argument("--attn_sigma_max", type=float, default=1.0)
+    parser.add_argument("--attn_t_min", type=int, default=0)
+    parser.add_argument("--attn_t_max", type=int, default=999)
+    parser.add_argument("--attn_gate_mode", type=str, default="sigma", choices=["sigma", "timestep"])
+    parser.add_argument("--attn_gate_min_batch", type=int, default=1)
+    parser.add_argument("--attn_mask_align_mode", type=str, default="concat", choices=["concat", "truncate", "pad"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--log_image_steps", type=int, default=0)
@@ -474,6 +635,8 @@ def main():
     parser.add_argument("--streaming_threshold_mb", type=int, default=200)
     parser.add_argument("--cache_dir", type=str, default="")
     parser.add_argument("--cast_teacher_unet", action="store_true")
+    parser.add_argument("--fuse_block_fallback_unfreeze", type=_parse_bool, default=True)
+    parser.add_argument("--optimizer_add_fuse_block", type=_parse_bool, default=True)
     args = parser.parse_args()
 
     if args.w_min > args.w_max:
@@ -545,7 +708,7 @@ def main():
     for p in student.parameters():
         p.requires_grad = False
 
-    target_modules = build_lora_target_modules(student)
+    target_modules = build_lora_target_modules(student, include_fuse_block=False)
     if len(target_modules) == 0:
         raise RuntimeError("No LoRA target modules found. Check model naming.")
 
@@ -574,10 +737,34 @@ def main():
 
     student.train()
 
+    fuse_block_params = []
+    fuse_block_names = [name for name, p in student.named_parameters() if "fuse_block_za" in name and p.requires_grad]
+    if args.fuse_block_fallback_unfreeze and len(fuse_block_names) == 0:
+        for name, p in student.named_parameters():
+            if "fuse_block_za" in name:
+                p.requires_grad = True
+                fuse_block_params.append(p)
+                fuse_block_names.append(name)
+        if accelerator.is_local_main_process:
+            accelerator.print(
+                f"[fuse_block_za] fallback unfreeze, trainable params: {len(fuse_block_names)}"
+            )
+    elif accelerator.is_local_main_process:
+        accelerator.print(f"[fuse_block_za] trainable params: {len(fuse_block_names)}")
+
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, student.parameters()),
         lr=args.learning_rate,
     )
+    if args.optimizer_add_fuse_block and fuse_block_params:
+        opt_param_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+        new_params = [p for p in fuse_block_params if id(p) not in opt_param_ids]
+        if new_params:
+            optimizer.add_param_group({"params": new_params, "lr": args.learning_rate})
+            if accelerator.is_local_main_process:
+                accelerator.print(
+                    f"[fuse_block_za] added {len(new_params)} params to optimizer (groups={len(optimizer.param_groups)})"
+                )
 
     if args.use_mock_dataset:
         dataset = AnyTextMockDataset(size=1000, resolution=args.resolution)
@@ -662,6 +849,14 @@ def main():
 
     teacher_wrapper = AnyText2ForwardWrapper(teacher, device)
     student_wrapper = AnyText2ForwardWrapper(student, device)
+    student_unet = resolve_unet_for_attn(accelerator.unwrap_model(student))
+    teacher_unet = resolve_unet_for_attn(teacher)
+    student_attn_modules = collect_attn_modules(student_unet)
+    teacher_attn_modules = collect_attn_modules(teacher_unet)
+    tokenizer = getattr(teacher_wrapper.base_model.cond_stage_model, "tokenizer", None)
+    placeholder_token = None
+    if hasattr(teacher_wrapper.base_model, "embedding_manager") and teacher_wrapper.base_model.embedding_manager is not None:
+        placeholder_token = teacher_wrapper.base_model.embedding_manager.placeholder_token
 
     if args.cast_teacher_unet:
         if args.mixed_precision == "fp16":
@@ -696,6 +891,8 @@ def main():
             ffl_batch_matrix=args.ffl_batch_matrix,
             text_weight=args.loss_text_weight,
         ).to(device)
+    attn_hw_allowlist = [int(v) for v in args.attn_hw_allowlist] if args.attn_hw_allowlist else []
+    attn_every = max(int(args.attn_every), 1)
 
     def get_text_mask(batch, mask_key=args.loss_mask_key, threshold=args.wm_thresh):
         key = mask_key
@@ -721,17 +918,6 @@ def main():
         if threshold is not None and 0.0 < float(threshold) < 1.0:
             thr = float(threshold)
         return (mask > thr).float()
-
-    def _normalize_text_mask(mask, target_shape):
-        if mask is None:
-            return None
-        if mask.dim() == 3:
-            mask = mask.unsqueeze(1)
-        if mask.dim() == 4 and mask.shape[1] > 1:
-            mask = mask.max(dim=1, keepdim=True).values
-        if mask.shape[-2:] != target_shape[-2:]:
-            mask = F.interpolate(mask, size=target_shape[-2:], mode="nearest")
-        return (mask > 0.5).float()
 
     def _loss_elementwise(pred, target, loss_type):
         if loss_type == "l2":
@@ -849,11 +1035,55 @@ def main():
                     _maybe_sync(timing_sync)
                     cond_time = time.perf_counter() - t0 if timing_enabled else 0.0
 
+                    attn_enabled = (
+                        args.loss_attn_weight > 0
+                        and attn_every > 0
+                        and (global_step % attn_every == 0)
+                        and len(student_attn_modules) > 0
+                    )
+                    gate_mask = None
+                    token_mask_spec = None
+                    if attn_enabled:
+                        gate_mask = _compute_attn_gate_mask(
+                            start_timesteps,
+                            sigma_schedule,
+                            args.attn_gate_mode,
+                            args.attn_sigma_min,
+                            args.attn_sigma_max,
+                            args.attn_t_min,
+                            args.attn_t_max,
+                        )
+                        if gate_mask.sum().item() < args.attn_gate_min_batch:
+                            attn_enabled = False
+                            gate_mask = None
+                        else:
+                            img_len = cond_text_emb["c_crossattn"][0][0].shape[1]
+                            text_len = cond_text_emb["c_crossattn"][0][1].shape[1]
+                            placeholder_mask_text = _build_placeholder_mask(
+                                batch["text_caption"], tokenizer, placeholder_token, text_len, device
+                            )
+                            img_mask = torch.zeros((batch_size, img_len), device=device, dtype=placeholder_mask_text.dtype)
+                            gate = gate_mask.float().view(-1, 1).to(device)
+                            img_mask = img_mask * gate
+                            text_mask = placeholder_mask_text * gate
+                            token_mask_spec = {
+                                "img_mask": img_mask,
+                                "text_mask": text_mask,
+                                "align": args.attn_mask_align_mode,
+                            }
+                    if attn_enabled:
+                        set_attn_recording(student_attn_modules, token_mask_spec, attn_hw_allowlist, True)
+                    else:
+                        set_attn_recording(student_attn_modules, None, None, False)
+
                     _maybe_sync(timing_sync)
                     t0 = time.perf_counter()
                     noise_pred = student_wrapper.forward(
                         noisy_latents, start_timesteps, cond_text_emb, cond_text_info, hint
                     )
+                    student_attn_masses = gather_attn_mass(student_attn_modules) if attn_enabled else []
+                    if attn_enabled:
+                        set_attn_recording(student_attn_modules, None, None, False)
                     student_pred_x0 = predicted_origin(
                         noise_pred,
                         start_timesteps,
@@ -869,9 +1099,14 @@ def main():
                     with torch.no_grad():
                         _maybe_sync(timing_sync)
                         t0 = time.perf_counter()
+                        if attn_enabled:
+                            set_attn_recording(teacher_attn_modules, token_mask_spec, attn_hw_allowlist, True)
                         cond_teacher_output = teacher_wrapper.forward(
                             noisy_latents, start_timesteps, cond_text_emb, cond_text_info, hint
                         )
+                        teacher_attn_masses = gather_attn_mass(teacher_attn_modules) if attn_enabled else []
+                        if attn_enabled:
+                            set_attn_recording(teacher_attn_modules, None, None, False)
                         uncond_teacher_output = teacher_wrapper.forward(
                             noisy_latents, start_timesteps, uncond_text_emb, uncond_text_info, hint
                         )
@@ -938,6 +1173,15 @@ def main():
                         loss_type=args.loss_type,
                     )
                     loss = lcm_loss
+                    loss_attn = lcm_loss.new_tensor(0.0)
+                    if attn_enabled:
+                        attn_text_mask = text_mask
+                        if gate_mask is not None and attn_text_mask is not None:
+                            attn_text_mask = attn_text_mask * gate_mask.float().view(-1, 1, 1, 1).to(attn_text_mask.device)
+                        attn_loss_val = _compute_attn_loss(student_attn_masses, teacher_attn_masses, attn_text_mask)
+                        if attn_loss_val is not None:
+                            loss_attn = attn_loss_val
+                            loss = loss + args.loss_attn_weight * loss_attn
                     loss_teacher_x0 = lcm_loss.new_tensor(0.0)
                     if args.loss_teacher_x0_weight > 0:
                         loss_teacher_x0, _ = compute_mask_weighted_loss(
@@ -948,6 +1192,52 @@ def main():
                             loss_type=args.loss_type,
                         )
                         loss = loss + args.loss_teacher_x0_weight * loss_teacher_x0
+                    pred_img = None
+                    loss_ocr = lcm_loss.new_tensor(0.0)
+                    if args.loss_ocr_weight > 0 and args.ocr_every > 0 and global_step % args.ocr_every == 0:
+                        recog = getattr(teacher_wrapper.base_model, "cn_recognizer", None)
+                        if recog is not None:
+                            if pred_img is None:
+                                pred_img = student_wrapper.base_model.decode_first_stage(student_pred_x0)
+                            pred_255 = ((pred_img + 1.0) * 127.5).clamp(0, 255)
+                            crops, gt_texts = _extract_text_crops(
+                                pred_255, cond_batch["positions"], cond_batch["n_lines"], cond_batch["texts"]
+                            )
+                            if len(crops) > 0:
+                                preds, _ = recog.pred_imglist(crops)
+                                weight = torch.ones(len(gt_texts), device=preds.device)
+                                loss_ocr = recog.get_ctcloss(preds, gt_texts, weight).mean()
+                                loss = loss + args.loss_ocr_weight * loss_ocr
+                    loss_cldice = lcm_loss.new_tensor(0.0)
+                    if args.loss_cldice_weight > 0:
+                        if pred_img is None:
+                            pred_img = student_wrapper.base_model.decode_first_stage(student_pred_x0)
+                        img_nchw = cond_batch["img"].permute(0, 3, 1, 2)
+                        masked_nchw = cond_batch["masked_img"].permute(0, 3, 1, 2)
+                        diff_pred = (pred_img - masked_nchw).abs().mean(dim=1, keepdim=True)
+                        diff_gt = (img_nchw - masked_nchw).abs().mean(dim=1, keepdim=True)
+                        diff_pred = diff_pred * text_mask if text_mask is not None else diff_pred
+                        diff_gt = diff_gt * text_mask if text_mask is not None else diff_gt
+                        target_hw = 128
+                        diff_pred = F.interpolate(diff_pred, size=(target_hw, target_hw), mode="bilinear", align_corners=False)
+                        diff_gt = F.interpolate(diff_gt, size=(target_hw, target_hw), mode="bilinear", align_corners=False)
+                        mask_small = None
+                        if text_mask is not None:
+                            mask_small = F.interpolate(text_mask, size=(target_hw, target_hw), mode="nearest")
+                        if mask_small is None or mask_small.sum() > 0:
+                            if not torch.isfinite(diff_pred).any() or not torch.isfinite(diff_gt).any():
+                                loss_cldice = loss_cldice.new_tensor(0.0)
+                            elif diff_pred.abs().sum() <= 0 or diff_gt.abs().sum() <= 0:
+                                loss_cldice = loss_cldice.new_tensor(0.0)
+                            else:
+                                if args.stroke_tau < 0:
+                                    tau = _compute_stroke_tau(diff_pred, mask_small, default_tau=0.1)
+                                else:
+                                    tau = diff_pred.new_full((diff_pred.shape[0], 1, 1, 1), float(args.stroke_tau))
+                                stroke_pred = torch.sigmoid(args.stroke_k * (diff_pred - tau))
+                                stroke_gt = torch.sigmoid(args.stroke_k * (diff_gt - tau))
+                                loss_cldice = cldice_loss(stroke_pred, stroke_gt, mask=mask_small, iters=args.cldice_iters)
+                                loss = loss + args.loss_cldice_weight * loss_cldice
                     loss_ffl = lcm_loss.new_tensor(0.0)
                     loss_grad = lcm_loss.new_tensor(0.0)
                     if high_freq_loss is not None:
@@ -996,6 +1286,9 @@ def main():
                     lcm_raw_val = lcm_raw.detach().float().item()
                     mask_ratio = mask_lat.mean().detach().float().item() if mask_lat is not None else None
                     loss_teacher_x0_val = loss_teacher_x0.detach().float().item()
+                    loss_attn_val = loss_attn.detach().float().item()
+                    loss_ocr_val = loss_ocr.detach().float().item()
+                    loss_cldice_val = loss_cldice.detach().float().item()
                     ffl_val = None
                     grad_val = None
                     if high_freq_loss is not None:
@@ -1017,6 +1310,12 @@ def main():
                         postfix["mask"] = f"{mask_ratio:.3f}"
                     if args.loss_teacher_x0_weight > 0:
                         postfix["x0"] = f"{loss_teacher_x0_val:.4f}"
+                    if args.loss_attn_weight > 0:
+                        postfix["attn"] = f"{loss_attn_val:.4f}"
+                    if args.loss_ocr_weight > 0:
+                        postfix["ocr"] = f"{loss_ocr_val:.4f}"
+                    if args.loss_cldice_weight > 0:
+                        postfix["cldice"] = f"{loss_cldice_val:.4f}"
                     if ffl_val is not None and grad_val is not None:
                         postfix["ffl"] = f"{ffl_val:.4f}"
                         postfix["grad"] = f"{grad_val:.4f}"
@@ -1049,6 +1348,9 @@ def main():
                             "train/lcm_raw": lcm_raw_val,
                             "train/mask_ratio": mask_ratio if mask_ratio is not None else 0.0,
                             "train/teacher_x0": loss_teacher_x0_val,
+                            "train/attn": loss_attn_val,
+                            "train/ocr": loss_ocr_val,
+                            "train/cldice": loss_cldice_val,
                             "train/lr": lr,
                             "train/it_s": it_s,
                             "train/epoch": epoch + 1,
