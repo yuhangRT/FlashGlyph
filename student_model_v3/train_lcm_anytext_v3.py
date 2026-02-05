@@ -45,7 +45,7 @@ from student_model_v3.losses import HighFreqTextLoss
 from student_model_v3.attn_distill import (
     collect_attn_modules,
     gather_attn_mass,
-    resolve_unet_for_attn,
+    resolve_control_for_attn,
     set_attn_recording,
 )
 from student_model_v3.topology_loss import cldice_loss
@@ -635,6 +635,7 @@ def main():
     parser.add_argument("--streaming_threshold_mb", type=int, default=200)
     parser.add_argument("--cache_dir", type=str, default="")
     parser.add_argument("--cast_teacher_unet", action="store_true")
+    parser.add_argument("--lora_include_fuse_block", type=_parse_bool, default=True)
     parser.add_argument("--fuse_block_fallback_unfreeze", type=_parse_bool, default=True)
     parser.add_argument("--optimizer_add_fuse_block", type=_parse_bool, default=True)
     args = parser.parse_args()
@@ -708,7 +709,7 @@ def main():
     for p in student.parameters():
         p.requires_grad = False
 
-    target_modules = build_lora_target_modules(student, include_fuse_block=False)
+    target_modules = build_lora_target_modules(student, include_fuse_block=args.lora_include_fuse_block)
     if len(target_modules) == 0:
         raise RuntimeError("No LoRA target modules found. Check model naming.")
 
@@ -849,14 +850,20 @@ def main():
 
     teacher_wrapper = AnyText2ForwardWrapper(teacher, device)
     student_wrapper = AnyText2ForwardWrapper(student, device)
-    student_unet = resolve_unet_for_attn(accelerator.unwrap_model(student))
-    teacher_unet = resolve_unet_for_attn(teacher)
-    student_attn_modules = collect_attn_modules(student_unet)
-    teacher_attn_modules = collect_attn_modules(teacher_unet)
+    student_control = resolve_control_for_attn(student_wrapper.base_model)
+    teacher_control = resolve_control_for_attn(teacher_wrapper.base_model)
+    student_attn_modules = collect_attn_modules(student_control)
+    teacher_attn_modules = collect_attn_modules(teacher_control)
     tokenizer = getattr(teacher_wrapper.base_model.cond_stage_model, "tokenizer", None)
     placeholder_token = None
     if hasattr(teacher_wrapper.base_model, "embedding_manager") and teacher_wrapper.base_model.embedding_manager is not None:
         placeholder_token = teacher_wrapper.base_model.embedding_manager.placeholder_token
+
+    if args.loss_attn_weight > 0:
+        if os.environ.get("DISABLE_XFORMERS", "0") != "1":
+            raise RuntimeError("loss_attn_weight>0 requires DISABLE_XFORMERS=1")
+        if len(student_attn_modules) == 0 or len(teacher_attn_modules) == 0:
+            raise RuntimeError("attn modules empty on control_model; check model/config")
 
     if args.cast_teacher_unet:
         if args.mixed_precision == "fp16":
@@ -957,6 +964,7 @@ def main():
     last_log_step = 0
     sanity_checked = False
     ema_loss = None
+    first_attn_check_done = False
 
     progress_bar = tqdm(
         total=total_updates,
@@ -1057,21 +1065,16 @@ def main():
                             attn_enabled = False
                             gate_mask = None
                         else:
-                            img_len = cond_text_emb["c_crossattn"][0][0].shape[1]
                             text_len = cond_text_emb["c_crossattn"][0][1].shape[1]
                             placeholder_mask_text = _build_placeholder_mask(
                                 batch["text_caption"], tokenizer, placeholder_token, text_len, device
                             )
-                            img_mask = torch.zeros((batch_size, img_len), device=device, dtype=placeholder_mask_text.dtype)
                             gate = gate_mask.float().view(-1, 1).to(device)
-                            img_mask = img_mask * gate
-                            text_mask = placeholder_mask_text * gate
-                            token_mask_spec = {
-                                "img_mask": img_mask,
-                                "text_mask": text_mask,
-                                "align": args.attn_mask_align_mode,
-                            }
+                            tok_mask_text = placeholder_mask_text * gate
+                            token_mask_spec = {"text_mask": tok_mask_text}
                     if attn_enabled:
+                        if token_mask_spec is None:
+                            raise RuntimeError("attn_distill enabled but token_mask_spec is None")
                         set_attn_recording(student_attn_modules, token_mask_spec, attn_hw_allowlist, True)
                     else:
                         set_attn_recording(student_attn_modules, None, None, False)
@@ -1107,6 +1110,23 @@ def main():
                         teacher_attn_masses = gather_attn_mass(teacher_attn_modules) if attn_enabled else []
                         if attn_enabled:
                             set_attn_recording(teacher_attn_modules, None, None, False)
+                            if not first_attn_check_done:
+                                placeholder_sum = 0.0
+                                if token_mask_spec is not None:
+                                    mask_val = token_mask_spec.get("text_mask") if isinstance(token_mask_spec, dict) else token_mask_spec
+                                    if mask_val is not None:
+                                        placeholder_sum = float(mask_val.sum().detach().cpu().item())
+                                if accelerator.is_local_main_process:
+                                    accelerator.print(f"[attn_distill] placeholder_mask_text.sum={placeholder_sum:.1f}")
+                                all_masses = student_attn_masses + teacher_attn_masses
+                                if any(m is None for m in all_masses):
+                                    raise RuntimeError("attn_distill mass is None; check recorder/mask alignment")
+                                total_mass = 0.0
+                                for m in all_masses:
+                                    total_mass += float(m.abs().sum().detach().cpu().item())
+                                if total_mass <= 1e-6:
+                                    raise RuntimeError("attn_distill mass all near zero; placeholder/mask invalid")
+                                first_attn_check_done = True
                         uncond_teacher_output = teacher_wrapper.forward(
                             noisy_latents, start_timesteps, uncond_text_emb, uncond_text_info, hint
                         )
@@ -1175,10 +1195,14 @@ def main():
                     loss = lcm_loss
                     loss_attn = lcm_loss.new_tensor(0.0)
                     if attn_enabled:
-                        attn_text_mask = text_mask
-                        if gate_mask is not None and attn_text_mask is not None:
-                            attn_text_mask = attn_text_mask * gate_mask.float().view(-1, 1, 1, 1).to(attn_text_mask.device)
-                        attn_loss_val = _compute_attn_loss(student_attn_masses, teacher_attn_masses, attn_text_mask)
+                        attn_spatial_mask = get_text_mask(
+                            cond_batch, mask_key=args.loss_mask_key, threshold=args.wm_thresh
+                        )
+                        if attn_spatial_mask is not None:
+                            attn_spatial_mask = attn_spatial_mask.to(device, non_blocking=non_blocking)
+                        if gate_mask is not None and attn_spatial_mask is not None:
+                            attn_spatial_mask = attn_spatial_mask * gate_mask.float().view(-1, 1, 1, 1).to(attn_spatial_mask.device)
+                        attn_loss_val = _compute_attn_loss(student_attn_masses, teacher_attn_masses, attn_spatial_mask)
                         if attn_loss_val is not None:
                             loss_attn = attn_loss_val
                             loss = loss + args.loss_attn_weight * loss_attn

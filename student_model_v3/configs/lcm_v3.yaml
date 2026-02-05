@@ -52,6 +52,8 @@ train:
   loss_attn_weight: 0.1
   attn_every: 4
   attn_hw_allowlist: [32, 64]
+  lora_include_fuse_block: true
+  disable_xformers: true
   attn_sigma_min: 0.2
   attn_sigma_max: 1.0
   attn_t_min: 0
@@ -65,6 +67,8 @@ train:
   cldice_iters: 10
   stroke_tau: -1.0
   stroke_k: 12.0
+  loss_ffl_weight: 0.0
+  loss_grad_weight: 0.0
   logging_steps: 10
   log_image_steps: 500
   log_image_samples: 4
@@ -84,7 +88,6 @@ train:
   seed: 42
   fuse_block_fallback_unfreeze: true
   optimizer_add_fuse_block: true
-  disable_xformers: true
 
 system:
   notes: "Official-style LCM-LoRA distillation for AnyText2 (v3)."

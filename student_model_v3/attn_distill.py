@@ -36,8 +36,9 @@ def set_attn_recording(
 def gather_attn_mass(modules: Iterable[CrossAttention]) -> List[Optional[object]]:
     masses: List[Optional[object]] = []
     for module in modules:
-        masses.append(module._last_mass)
-        module._last_mass = None
+        if getattr(module, "_record_attn", False):
+            masses.append(module._last_mass)
+            module._last_mass = None
     return masses
 
 
@@ -51,4 +52,15 @@ def resolve_unet_for_attn(model):
     if hasattr(model, "diffusion_model"):
         return model.diffusion_model
     logger.warning("Falling back to the provided model for attention traversal.")
+    return model
+
+
+def resolve_control_for_attn(model):
+    if hasattr(model, "control_model"):
+        return model.control_model
+    if hasattr(model, "base_model") and hasattr(model.base_model, "control_model"):
+        return model.base_model.control_model
+    if hasattr(model, "model") and hasattr(model.model, "control_model"):
+        return model.model.control_model
+    logger.warning("Cannot resolve control_model for attn traversal, fallback to provided model.")
     return model

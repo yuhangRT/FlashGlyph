@@ -167,38 +167,33 @@ class CrossAttention(nn.Module):
         self._last_mass = None
         self._attn_hw_allowlist = None
 
+    def _align_token_mask(self, mask, context_len, device, dtype):
+        if mask is None:
+            return torch.zeros((0, context_len), device=device, dtype=dtype)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        mask = mask.to(device=device, dtype=dtype)
+        if mask.shape[1] >= context_len:
+            return mask[:, :context_len]
+        pad = torch.zeros((mask.shape[0], context_len - mask.shape[1]), device=device, dtype=dtype)
+        return torch.cat([mask, pad], dim=1)
+
     def _build_token_mask(self, batch_size, context_len, device, dtype):
-        spec = self._token_mask_spec or {}
-        img_mask = spec.get("img_mask")
-        text_mask = spec.get("text_mask")
-        align = spec.get("align", "concat")
-
-        def _normalize_mask(mask):
-            if mask is None:
-                return torch.zeros((batch_size, 0), device=device, dtype=dtype)
-            mask = mask.to(device=device, dtype=dtype)
-            if mask.dim() == 1:
-                mask = mask.unsqueeze(0)
-            if mask.shape[0] == 1 and batch_size > 1:
-                mask = mask.expand(batch_size, -1)
-            if mask.shape[0] < batch_size:
-                pad = torch.zeros((batch_size - mask.shape[0], mask.shape[1]), device=device, dtype=dtype)
-                mask = torch.cat([mask, pad], dim=0)
-            elif mask.shape[0] > batch_size:
-                mask = mask[:batch_size]
-            return mask
-
-        img_mask = _normalize_mask(img_mask)
-        text_mask = _normalize_mask(text_mask)
-        base = torch.cat([img_mask, text_mask], dim=1)
-        if align == "concat" and base.shape[1] == context_len:
-            mask = base
+        spec = self._token_mask_spec
+        if isinstance(spec, dict):
+            mask = spec.get("text_mask")
         else:
-            if base.shape[1] >= context_len:
-                mask = base[:, :context_len]
-            else:
-                pad = torch.zeros((batch_size, context_len - base.shape[1]), device=device, dtype=dtype)
-                mask = torch.cat([base, pad], dim=1)
+            mask = spec
+        if mask is None:
+            return torch.zeros((batch_size, context_len), device=device, dtype=dtype)
+        mask = self._align_token_mask(mask, context_len, device, dtype)
+        if mask.shape[0] == 1 and batch_size > 1:
+            mask = mask.expand(batch_size, -1)
+        if mask.shape[0] < batch_size:
+            pad = torch.zeros((batch_size - mask.shape[0], mask.shape[1]), device=device, dtype=dtype)
+            mask = torch.cat([mask, pad], dim=0)
+        elif mask.shape[0] > batch_size:
+            mask = mask[:batch_size]
         return mask
 
     def _compute_attn_mass(self, sim, heads):
@@ -208,7 +203,8 @@ class CrossAttention(nn.Module):
             query_len = sim.shape[1]
             sqrt_len = int(math.sqrt(query_len))
             if sqrt_len * sqrt_len != query_len or sqrt_len not in self._attn_hw_allowlist:
-                return None
+                batch_size = sim.shape[0] // heads
+                return sim.new_zeros((batch_size, sim.shape[1]))
         batch_size = sim.shape[0] // heads
         context_len = sim.shape[-1]
         mask = self._build_token_mask(batch_size, context_len, sim.device, sim.dtype)
