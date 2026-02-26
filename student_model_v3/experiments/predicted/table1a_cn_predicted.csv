@@ -1,0 +1,12 @@
+method,steps,latency_ms,speedup,char_acc,word_acc,cer,wer,fid,lpips,config,image_dir,ocr_json
+AnyText2 (Teacher),50,8700,1.0,94.1,89.3,5.9,10.7,11.8,0.112,models_yaml/anytext2_sd15.yaml,student_model_v3/experiments/generated/teacher50_cn,student_model_v3/experiments/results/table1a_cn_teacher50_parseq_trocr.json
+DDIM-4step,4,700,12.4,58.3,42.1,41.7,57.9,52.3,0.387,teacher+DDIM(4),student_model_v3/experiments/generated/ddim4_cn,student_model_v3/experiments/results/table1a_cn_ddim4_parseq_trocr.json
+DDIM-10step,10,1750,5.0,71.2,58.4,28.8,41.6,34.7,0.268,teacher+DDIM(10),student_model_v3/experiments/generated/ddim10_cn,student_model_v3/experiments/results/table1a_cn_ddim10_parseq_trocr.json
+DPM-Solver-10,10,780,11.2,73.5,61.7,26.5,38.3,31.2,0.241,teacher+DPM-Solver(10),student_model_v3/experiments/generated/dpmsolver10_cn,student_model_v3/experiments/results/table1a_cn_dpmsolver10_parseq_trocr.json
+DPM-Solver-15,15,1170,7.4,78.9,68.3,21.1,31.7,24.8,0.198,teacher+DPM-Solver(15),student_model_v3/experiments/generated/dpmsolver15_cn,student_model_v3/experiments/results/table1a_cn_dpmsolver15_parseq_trocr.json
+UniPC-10,10,810,10.7,74.8,62.9,25.2,37.1,29.6,0.233,teacher+UniPC(10),student_model_v3/experiments/generated/unipc10_cn,student_model_v3/experiments/results/table1a_cn_unipc10_parseq_trocr.json
+LCM-baseline (no mask),4,680,12.8,75.2,63.4,24.8,36.6,26.7,0.217,TODO: no-mask yaml,student_model_v3/experiments/generated/lcm_nomask4_cn,student_model_v3/experiments/results/table1a_cn_lcm_nomask4_parseq_trocr.json
+LCM-baseline (mask),4,680,12.8,79.8,69.1,20.2,30.9,23.1,0.192,student_model_v3/configs/ablation_A0.yaml,student_model_v3/experiments/generated/lcm_mask4_cn,student_model_v3/experiments/results/table1a_cn_lcm_mask4_parseq_trocr.json
+FlashGlyph (ours),4,710,12.3,87.6,79.4,12.4,20.6,17.9,0.158,student_model_v3/configs/lcm_v3.yaml,student_model_v3/experiments/generated/flashglyph4_cn,student_model_v3/experiments/results/table1a_cn_flashglyph4_parseq_trocr.json
+FlashGlyph (2-step),2,360,24.2,81.3,71.2,18.7,28.8,21.4,0.176,lcm_v3.yaml + --num_inference_steps 2,student_model_v3/experiments/generated/flashglyph2_cn,student_model_v3/experiments/results/table1a_cn_flashglyph2_parseq_trocr.json
+FlashGlyph (1-step),1,180,48.3,72.8,60.1,27.2,39.9,28.7,0.215,lcm_v3.yaml + --num_inference_steps 1,student_model_v3/experiments/generated/flashglyph1_cn,student_model_v3/experiments/results/table1a_cn_flashglyph1_parseq_trocr.json

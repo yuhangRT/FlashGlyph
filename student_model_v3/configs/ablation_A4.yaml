@@ -1,7 +1,7 @@
 model:
   config: models_yaml/anytext2_sd15.yaml
   teacher_ckpt: models/anytext_v2.0.ckpt
-  output_dir: student_model_v3/checkpoints/train_A1_attn
+  output_dir: student_model_v3/checkpoints/train_A4_attn_ocr_topo_sharp
 
 data:
   cache_dir: dataset_cache/anytext2
@@ -61,14 +61,14 @@ train:
   attn_gate_mode: sigma
   attn_gate_min_batch: 1
   attn_mask_align_mode: concat
-  loss_ocr_weight: 0.0
+  loss_ocr_weight: 0.01
   ocr_every: 8
-  loss_cldice_weight: 0.0
+  loss_cldice_weight: 0.1
   cldice_iters: 10
   stroke_tau: -1.0
   stroke_k: 12.0
-  loss_ffl_weight: 0.0
-  loss_grad_weight: 0.0
+  loss_ffl_weight: 0.05
+  loss_grad_weight: 0.05
   logging_steps: 10
   log_image_steps: 500
   log_image_samples: 4
@@ -90,4 +90,4 @@ train:
   optimizer_add_fuse_block: true
 
 system:
-  notes: "A1: +Attention only."
+  notes: "A4: +Attention + OCR + Topology + Sharpness (FFL/Grad)."

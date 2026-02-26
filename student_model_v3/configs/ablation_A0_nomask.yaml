@@ -1,7 +1,7 @@
 model:
   config: models_yaml/anytext2_sd15.yaml
   teacher_ckpt: models/anytext_v2.0.ckpt
-  output_dir: student_model_v3/checkpoints/train_A1_attn
+  output_dir: student_model_v3/checkpoints/train_A0_nomask
 
 data:
   cache_dir: dataset_cache/anytext2
@@ -49,7 +49,7 @@ train:
   loss_type: l2
   huber_c: 0.001
   loss_teacher_x0_weight: 0.0
-  loss_attn_weight: 0.1
+  loss_attn_weight: 0.0
   attn_every: 4
   attn_hw_allowlist: [32, 64]
   lora_include_fuse_block: true
@@ -90,4 +90,4 @@ train:
   optimizer_add_fuse_block: true
 
 system:
-  notes: "A1: +Attention only."
+  notes: "A0-nomask: no text-region reweighting (loss_text_weight=1.0)."

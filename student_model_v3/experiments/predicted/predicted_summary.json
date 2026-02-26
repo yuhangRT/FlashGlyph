@@ -1,0 +1,18 @@
+{
+  "source": "Predicted from flashglyph_paper.md (current in-repo tables)",
+  "note": "Not measured from real artifacts yet; use for TABLE_SOURCES pre-fill only.",
+  "files": [
+    "table1a_cn_predicted.csv",
+    "table1b_en_predicted.csv",
+    "table2_cn_predicted.csv",
+    "table2_en_predicted.csv",
+    "table4_cn_predicted.csv"
+  ],
+  "counts": {
+    "table1a_cn_rows": 11,
+    "table1b_en_rows": 11,
+    "table2_cn_rows": 5,
+    "table2_en_rows": 5,
+    "table4_cn_rows": 5
+  }
+}

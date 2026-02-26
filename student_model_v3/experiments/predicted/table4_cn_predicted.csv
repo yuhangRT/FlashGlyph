@@ -1,0 +1,6 @@
+steps,latency_ms,char_acc,fid,scenario,image_dir
+1,180,72.8,28.7,实时预览,student_model_v3/experiments/generated/flashglyph1_cn
+2,360,81.3,21.4,交互式编辑,student_model_v3/experiments/generated/flashglyph2_cn
+4,710,87.6,17.9,标准模式,student_model_v3/experiments/generated/flashglyph4_cn
+8,1420,90.7,14.3,高质量模式,student_model_v3/experiments/generated/flashglyph8_cn
+50,8700,94.1,11.8,离线渲染,student_model_v3/experiments/generated/teacher50_cn

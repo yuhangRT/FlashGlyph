@@ -1,7 +1,7 @@
 model:
   config: models_yaml/anytext2_sd15.yaml
   teacher_ckpt: models/anytext_v2.0.ckpt
-  output_dir: student_model_v3/checkpoints/train_A2_maskLCM_x0_fflgrad
+  output_dir: student_model_v3/checkpoints/train_A2_attn_ocr
 
 data:
   cache_dir: dataset_cache/anytext2
@@ -28,13 +28,13 @@ data:
 
 train:
   train_script: student_model_v3/train_lcm_anytext_v3.py
-  train_batch_size: 1
-  gradient_accumulation_steps: 1
-  learning_rate: 5e-5
+  train_batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-4
   lr_scheduler: none
   lr_warmup_steps: 0
   lr_min_ratio: 0.0
-  max_train_steps: 1000
+  max_train_steps: 50000
   max_epochs: 0
   mixed_precision: fp16
   lora_rank: 64
@@ -43,29 +43,40 @@ train:
   num_ddim_timesteps: 50
   num_inference_steps: 4
   cfg_scale: 7.5
-  use_cfg: true
+  use_cfg: false
   w_min: 5.0
   w_max: 15.0
-  loss_type: huber
+  loss_type: l2
   huber_c: 0.001
-  loss_mask_key: hint
-  loss_text_weight: 5.0
-  loss_teacher_x0_weight: 0.02
-  loss_ffl_weight: 0.01
-  loss_grad_weight: 0.005
-  ffl_alpha: 1.0
-  ffl_patch_factor: 1
-  ffl_ave_spectrum: false
-  ffl_log_matrix: false
-  ffl_batch_matrix: false
+  loss_teacher_x0_weight: 0.0
+  loss_attn_weight: 0.1
+  attn_every: 4
+  attn_hw_allowlist: [32, 64]
+  lora_include_fuse_block: true
+  disable_xformers: true
+  attn_sigma_min: 0.2
+  attn_sigma_max: 1.0
+  attn_t_min: 0
+  attn_t_max: 999
+  attn_gate_mode: sigma
+  attn_gate_min_batch: 1
+  attn_mask_align_mode: concat
+  loss_ocr_weight: 0.01
+  ocr_every: 8
+  loss_cldice_weight: 0.0
+  cldice_iters: 10
+  stroke_tau: -1.0
+  stroke_k: 12.0
+  loss_ffl_weight: 0.0
+  loss_grad_weight: 0.0
   logging_steps: 10
-  log_image_steps: 100
+  log_image_steps: 500
   log_image_samples: 4
   log_image_infer_steps: 4
   timing_steps: 0
   timing_cuda_sync: false
-  save_steps: 0
-  num_workers: 4
+  save_steps: 2000
+  num_workers: 8
   prefetch_factor: 4
   persistent_workers: true
   pin_memory: true
@@ -75,6 +86,8 @@ train:
   cudnn_benchmark: true
   matmul_precision: high
   seed: 42
+  fuse_block_fallback_unfreeze: true
+  optimizer_add_fuse_block: true
 
 system:
-  notes: "A2: mask-weighted LCM + teacher-x0 + light FFL/Grad, 1k steps."
+  notes: "A2: +Attention + OCR."
