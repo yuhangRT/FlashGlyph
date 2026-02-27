@@ -65,43 +65,282 @@ FlashGlyph 采用教师—学生蒸馏结构。教师模型 T 为冻结的 AnyTe
 
 *图 1 FlashGlyph 总体蒸馏框架示意图（建议在此处绘制：教师/学生共享控制信号，LCM 主损失 + 三重可读性约束，推理为 1～4 步）。*
 
-### 3.2 基础蒸馏：LCM-LoRA 一致性蒸馏
+### 3.2 基础蒸馏：区域加权的 LCM-LoRA 一致性蒸馏（最终版）
 
-我们采用 LCM 的一致性蒸馏思想学习从任意时间步到解的短程映射。给定潜变量 z，在时间步 t 的噪声状态为：x_t = α_t z + σ_t ε，其中 ε ~ N(0, I)。学生模型在条件 c 下预测噪声或 x0（两者可互相转换），并通过一个少步更新得到目标状态 x_{t'}。一致性蒸馏的关键是构造一个“教师指导的一步目标”，并令学生在 x_t 与 x_{t'} 两个状态上的预测保持一致。
+我们采用教师—学生蒸馏框架：冻结教师扩散模型 $T$（AnyText2），学生模型 $S_\theta$ 与教师同构，仅训练注入的 LoRA 低秩适配参数 $\theta$。在潜扩散（Latent Diffusion）中，输入图像 $I$ 经 VAE 编码器 $\mathcal{E}$ 得到潜变量：
 
-为了在不破坏教师结构的前提下实现低成本蒸馏，学生仅训练 LoRA 适配器参数。LoRA 注入主要覆盖 UNet 与控制分支的注意力投影层及少量关键卷积层，从而在参数量与训练稳定性之间取得折中。
+$$
+x_0=\mathcal{E}(I)\in\mathbb{R}^{C\times H\times W}.
+$$
 
-在文本编辑中，优化预算应集中于文本区域。因此我们构建文本掩码 M_txt，并对一致性损失进行区域加权：L_LCM' = mean( (1 + λ_mask · M_txt) ⊙ L_LCM )。掩码加权只能提高文本区域误差权重，但不能保证语义与拓扑正确性，因此必须引入后续三重约束。
+对任意时间步 $t$，加噪状态为：
 
-### 3.3 约束一：注意力对齐蒸馏（Alignment）
+$$
+x_t=\alpha_t x_0+\sigma_t\varepsilon,\quad \varepsilon\sim\mathcal{N}(0,\mathbf{I}),
+$$
 
-少步推理时，文本控制信号需要通过 Cross-Attention 精确调制空间特征。为缓解条件引导失效，我们对齐教师与学生在控制分支 Cross-Attention 层的注意力响应。通过 tokenizer 获取文本相关 token，并将其注意力在 token 维度聚合为“空间注意力质量图”，只在文本区域内对齐教师与学生。
+其中 $\alpha_t=\sqrt{\bar\alpha_t}$、$\sigma_t=\sqrt{1-\bar\alpha_t}$。
 
-该约束的目标不是复制全部注意力细节，而是强制学生在关键文本 token 上“看对位置”。训练上建议使用 warmup：先用一致性目标稳定训练，再逐步增加注意力损失权重以提升收敛性。
+#### 3.2.1 Boundary-condition 一致性目标
 
-![图 2 注意力对齐蒸馏示意图（建议：token mask → attention mass → 空间分布对齐，仅在文本区域计算）。](figures/fig2.png)
+LCM 的关键是学习一个“从任意 $t$ 到解”的边界条件映射。我们用两组与时间步相关的缩放系数 $c_{\text{skip}}(t),c_{\text{out}}(t)$ 将学生的 $x_0$ 估计组合成一致性映射：
 
-*图 2 注意力对齐蒸馏示意图（建议：token mask → attention mass → 空间分布对齐，仅在文本区域计算）。*
+$$
+f_\theta(x_t,c)=c_{\text{skip}}(t)\,x_t+c_{\text{out}}(t)\,\hat x_0^\theta(x_t,c),
+$$
 
-### 3.4 约束二：OCR-CTC 语义监督（Semantics）
+其中 $c$ 表示 AnyText2 的条件（hint/positions/glyph/text embedding 等控制信号），$\hat x_0^\theta$ 由学生 UNet 输出（可能是 $\varepsilon / v / x_0$ 参数化之一，均可互转，这里统一写成 $x_0$ 形式）。
 
-为避免生成“像字但不可读”的伪纹理，本文引入冻结的文本识别器 R 对生成文本进行序列监督。训练时将学生预测的 x0 解码为图像 I_hat，按位置掩码裁剪文本行，输入识别器并计算 CTC 损失。识别器参数冻结，梯度仅回传至学生模型。为控制开销，OCR 约束可间隔触发并进行权重调度。
+#### 3.2.2 教师引导的一步转移（teacher-guided DDIM step）
 
-![图 3 OCR-CTC 语义监督流程（建议：裁剪 → 识别器 → CTC loss，强调训练识别器与测试识别器解耦）。](figures/fig3.png)
+为构造一致性对齐的“下一状态” $x_{t'}$（其中 $t'<t$），我们对教师做条件/无条件两次前向，形成 teacher-guidance：
 
-*图 3 OCR-CTC 语义监督流程（建议：裁剪 → 识别器 → CTC loss，强调训练识别器与测试识别器解耦）。*
+- 条件输出（cond）：$\hat x_{0,\text{cond}}^{T}(x_t,c)$、$\hat\varepsilon_{\text{cond}}^{T}(x_t,c)$
+- 无条件输出（uncond）：$\hat x_{0,\text{uncond}}^{T}(x_t,c)$、$\hat\varepsilon_{\text{uncond}}^{T}(x_t,c)$
 
-### 3.5 约束三：拓扑一致性（Topology）
+采样一个随机引导强度 $w\sim \mathcal{U}(w_{\min},w_{\max})$，构造“引导后的”教师预测：
 
-针对断笔、粘连与孔洞错误，本文引入软骨架化与 clDice 损失约束笔画连通性。在无逐像素标注的情况下，可通过生成结果与背景的差分构造近似笔画概率图，并限制在文本区域内进行骨架一致性约束。
+$$
+\hat x_{0}^{T,g}=\hat x_{0,\text{cond}}^{T}+w\big(\hat x_{0,\text{cond}}^{T}-\hat x_{0,\text{uncond}}^{T}\big),
+$$
 
-拓扑约束在工程上可视为对“笔画连通性”的软监督，对少步结果中的细长结构错误更敏感，建议采用逐步增权或间隔计算以保证训练稳定性。
+$$
+\hat\varepsilon^{T,g}=\hat\varepsilon_{\text{cond}}^{T}+w\big(\hat\varepsilon_{\text{cond}}^{T}-\hat\varepsilon_{\text{uncond}}^{T}\big).
+$$
 
-### 3.6 可选锐化项与总损失
+随后使用离散 DDIM 更新算子 $\Phi_{\text{DDIM}}$ 将 $x_t$ 单步推进到 $x_{t'}$：
 
-在三重约束建立后，边界锐度可通过轻量锐化项进行“抛光”，例如边界梯度对齐或频域损失（FFL）。锐化项不应主导训练，以免引入背景纹理伪影或过锐化。
+$$
+x_{t'}=\Phi_{\text{DDIM}}\big(x_t;\hat x_{0}^{T,g},\hat\varepsilon^{T,g},t\rightarrow t'\big).
+$$
 
-总损失可写为：L_total = L_LCM' + λ1 L_attn + λ2 L_ocr + λ3 L_topo + λ4 L_sharp。λ1～λ4 建议采用 warmup/分段策略：前期一致性为主，中期加入注意力与 OCR，后期加入拓扑约束并微量启用锐化项。
+该步骤在实现上对应“teacher 负责给出可信的一步过渡”，从而让学生学习更稳定的短路径一致性。
+
+#### 3.2.3 Stop-grad 目标与区域加权一致性损失
+
+接着我们在 $x_{t'}$ 上用学生再做一次前向，但停止梯度，构造一致性 target：
+
+$$
+\text{target}=\operatorname{sg}\big(f_\theta(x_{t'},c)\big),
+$$
+
+其中 $\operatorname{sg}(\cdot)$ 表示 stop-gradient（实现中为 no-grad 分支）。
+实现上，target 来自学生在 $x_{t'}$ 上的一次 no-grad 前向（可记作 $\theta^{-}$），并经同样的 boundary scaling 形成；教师不直接作为最终 target。
+
+由于文本编辑主要关注文本区域，我们构造像素空间的文本掩码 $M\in\{0,1\}^{H_I\times W_I}$，并下采样/对齐到潜空间分辨率得到 $M_{\text{lat}}\in\{0,1\}^{H\times W}$。掩码来源在实现里可选：由 hint、positions 叠加或 inv_mask 转换得到；本文统一记为 $M_{\text{lat}}$。
+
+定义文本加权系数 $w_{\text{text}}>1$，区域权重图为：
+
+$$
+W = 1+(w_{\text{text}}-1)\,M_{\text{lat}}.
+$$
+
+一致性误差采用逐元素的 $\rho(\cdot)$，可取 L2 或 Huber（与实现的 `loss_type∈{l2,huber}` 对齐）：
+
+$$
+\rho(u)=
+\begin{cases}
+u^2,& \text{(L2)}\\
+\sqrt{u^2+\delta^2}-\delta,& \text{(Huber)}
+\end{cases}
+$$
+
+最终的区域加权一致性损失写为（含权重归一化，与实现一致）：
+
+$$
+\mathcal{L}_{\text{LCM}'}=
+\mathbb{E}\left[
+\frac{
+\sum_{i} W_i \,\rho\Big(f_\theta(x_t,c)_i-\text{target}_{i}\Big)
+}{
+\sum_{i} W_i+\epsilon
+}\right],
+$$
+
+其中 $i$ 遍历潜空间所有位置与通道，$\epsilon$ 为数值稳定项。
+该归一化形式等价于 $\frac{\mathbb{E}[W\odot \rho]}{\mathbb{E}[W]}$，可避免 mask 面积变化导致 loss 尺度漂移。
+
+> 可选（消融用）：实现还支持额外的 teacher-$x_0$ 对齐项  
+> $\mathcal{L}_{x_0}=\mathbb{E}\big[\text{mask-weighted}(\hat x_0^\theta(x_t,c),\hat x_0^{T,g}(x_t,c))\big]$，但在主线配置中可置零。
+
+### 3.3 约束一：注意力对齐蒸馏（Alignment，最终版）
+
+少步推理时，“条件引导失效”通常表现为文本 token 对空间位置的关注漂移。为显式约束空间定位，我们在控制分支（ControlNet/Control-UNet）的 Cross-Attention 层对齐教师与学生的注意力质量图（Attention Mass Map）。
+
+设某一 Cross-Attention 层的注意力权重为：
+
+$$
+A\in\mathbb{R}^{(HW)\times L},\qquad
+A=\operatorname{Softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right),
+$$
+
+其中 $HW$ 为查询空间位置数，$L$ 为条件 token 长度。
+
+实现中，我们不直接使用“所有文本 token”，而是构造一个 token mask $m\in\{0,1\}^{L}$，它对应占位符 token（placeholder）在 tokenizer 序列中的位置（即“需要生成/编辑文本”的 token 段）。在多头注意力下，对被选 token 的注意力求和并对 heads 平均，得到 Attention Mass 向量 $s\in\mathbb{R}^{HW}$：
+
+$$
+s(p)=\frac{1}{H}\sum_{h=1}^{H}\sum_{j=1}^{L} m(j)\,A_h(p,j),
+$$
+
+将 $s$ reshape 为 $S\in\mathbb{R}^{H\times W}$ 即质量图。
+
+我们只在文本区域内对齐，并将质量图归一化为概率分布后，用 KL 散度（Teacher$\|$Student）对齐（与实现一致）：
+
+$$
+\tilde S = \frac{M_{\text{lat}}\odot S}{\sum_{x,y} (M_{\text{lat}}\odot S)(x,y)+\epsilon},
+$$
+
+$$
+\mathcal{L}_{\text{attn}}=
+\frac{1}{|\mathcal{L}|}\sum_{l\in\mathcal{L}}
+\operatorname{KL}\big(\tilde S_l^{(T)}\ \|\ \tilde S_l^{(S)}\big).
+$$
+
+实现触发策略（与代码对齐）：  
+该损失可按 step 间隔触发（如每 `attn_every` 步一次），并按噪声强度门控（仅在 $\sigma\in[\sigma_{\min},\sigma_{\max}]$ 的样本上计算）。此外，为保证可记录注意力矩阵，训练需禁用 xFormers 的 memory-efficient attention；否则无法获取显式 attention 权重用于 distill。
+
+### 3.4 约束二：OCR-CTC 语义监督（Semantics，最终版）
+
+为抑制“像字但不可读”的伪纹理，我们引入冻结文本识别器 $\mathcal{R}$（训练期使用，参数冻结），对生成结果施加 CTC 序列监督。
+工程上该识别器由 AnyText2 checkpoint 内置加载（PP-OCR 风格 CTC 识别器）；当 checkpoint 未包含 OCR 权重时，模块可实例化但监督信号会显著退化。本文实验统一使用包含 OCR 权重的 AnyText2 ckpt。
+
+#### 3.4.1 从潜空间到可识别文本块
+
+学生在 $x_t$ 上得到 $\hat x_0^\theta$ 后，通过 VAE 解码器 $\mathcal{D}$ 还原到像素空间：
+
+$$
+\hat I = \mathcal{D}(\hat x_0^\theta)\in[-1,1]^{3\times H_I\times W_I}.
+$$
+
+实现中将其线性映射到 $[0,255]$ 以适配识别器预处理。
+
+对每一行文本，数据提供一个二值位置掩码 $P_j\in\{0,1\}^{H_I\times W_I}$（来自 positions）。实现采用轴对齐 bbox 提取：先由 $P_j$ 得到最小外接矩形 $b(P_j)$，再 crop 并 resize 到固定识别尺寸（如 $48\times 320$）：
+
+$$
+I_{\text{crop}}^{(j)}=\operatorname{Resize}\big(\hat I[b(P_j)],\,48\times 320\big).
+$$
+
+（这一步与“多边形仿射矫正”不同；若未来加入仿射/透视校正，应在实现中显式提供。）
+
+#### 3.4.2 CTC 语义损失
+
+识别器输出字符类别 logits 序列 $P=\mathcal{R}(I_{\text{crop}})$。给定目标字符串 $y$，CTC 损失为：
+
+$$
+\mathcal{L}_{\text{ocr}}=\operatorname{CTC}(P,y)=-\log p(y\,|\,I_{\text{crop}}).
+$$
+
+训练时 $\mathcal{R}$ 冻结，仅将梯度回传到学生模型（通过 $\hat I$ 与 $\hat x_0^\theta$）。
+
+实现触发策略：OCR 监督通常间隔触发（如每 `ocr_every` 步计算一次）以控制训练开销。
+
+### 3.5 约束三：拓扑一致性（Topology，最终版）
+
+文本笔画具有细长连通拓扑结构，少步生成易出现断笔/粘连/孔洞错误。我们引入 soft-skeleton 与 clDice 损失显式约束拓扑一致性。
+
+#### 3.5.1 无像素级笔画真值下的 stroke 概率图构造
+
+我们不直接假设存在完美的笔画 GT，而是利用“原图 vs masked 图”的差分信号构造近似笔画强度：
+
+- 原图（含真值文本）记为 $I_{\text{gt}}$（数据 batch 的 `img`）
+- masked 图（背景/去字参考）记为 $I_{\text{mask}}$（数据 batch 的 `masked_img`）
+- 学生生成结果记为 $\hat I$
+
+定义灰度差分强度（对通道取均值）：
+
+$$
+d_S = \frac{1}{3}\sum_{c=1}^{3}\big|\hat I_c - I_{\text{mask},c}\big|,\qquad
+d_G = \frac{1}{3}\sum_{c=1}^{3}\big|I_{\text{gt},c} - I_{\text{mask},c}\big|.
+$$
+
+该定义与实现中的 `diff_pred = |pred - masked|`、`diff_gt = |img - masked|` 同构，仅在符号层面做了统一表达。
+
+为了得到平滑的 stroke 概率图，使用带阈值 $\tau$ 与斜率 $k$ 的 Sigmoid：
+
+$$
+V_S=\sigma\big(k(d_S-\tau)\big),\qquad
+V_G=\sigma\big(k(d_G-\tau)\big).
+$$
+
+实现中 $\tau$ 支持两种方式：固定常数，或在文本区域内从 $d_S$ 的分位数自适应估计；并将 $(V_S,V_G)$ 下采样到较小分辨率（如 $128\times128$）以稳定计算与降低开销。
+
+#### 3.5.2 Soft-skeleton 与 clDice
+
+对概率图做可微软骨架化（soft skeletonization）得到骨架：
+
+$$
+S_S=\operatorname{SoftSkel}(V_S),\qquad S_G=\operatorname{SoftSkel}(V_G).
+$$
+
+基于骨架与概率图的交集定义拓扑精确率与召回率：
+
+$$
+T_{\text{prec}}=\frac{\sum(S_S\odot V_G)}{\sum S_S+\epsilon},\qquad
+T_{\text{sens}}=\frac{\sum(S_G\odot V_S)}{\sum S_G+\epsilon}.
+$$
+
+最终 clDice 损失为：
+
+$$
+\mathcal{L}_{\text{topo}}=
+1-2\frac{T_{\text{prec}}T_{\text{sens}}}{T_{\text{prec}}+T_{\text{sens}}+\epsilon}.
+$$
+
+该损失对“连通性/孔洞/细长结构断裂”高度敏感，能针对性缓解少步推理下的结构坍塌。
+
+### 3.6 可选锐化项与总体优化目标（最终版）
+
+#### 3.6 可选锐化项（Residual FFL+Grad）与实现对齐说明（修订）
+
+在三重约束建立后，我们提供一个轻量“抛光”项用于进一步提升笔画边缘的清晰度。与直接对整幅潜变量施加频域损失不同，本文将锐化项作用于编辑残差（editing residual），以避免背景纹理频谱主导优化。
+
+设输入的 masked 潜变量（去字参考）为 $x_{\text{mask}}$，学生在时间步 $t$ 的无噪潜变量预测为 $\hat x_0^\theta$，教师的引导预测为 $\hat x_0^{T,g}$。我们定义残差潜变量：
+
+$$
+R_S = \hat x_0^\theta - x_{\text{mask}},\qquad
+R_T = \hat x_0^{T,g} - x_{\text{mask}}.
+$$
+
+为强调文本区域，同时避免硬掩码在频域引入的谱泄漏与振铃效应，我们将潜空间文本掩码 $M_{\text{lat}}$ 通过膨胀+高斯平滑构造为软窗函数 $\tilde M_{\text{lat}}\in[0,1]$，并对残差加窗：
+
+$$
+\tilde R_S = \tilde M_{\text{lat}}\odot R_S,\qquad
+\tilde R_T = \tilde M_{\text{lat}}\odot R_T.
+$$
+
+（1）频域损失（FFL）：对加窗残差的频谱差异施加 focal frequency loss：
+
+$$
+\mathcal{L}_{\text{ffl}}=\operatorname{FFL}(\tilde R_S,\tilde R_T).
+$$
+
+（2）边界梯度损失（Grad）：对加窗残差的空间梯度做 L1 对齐，并可进一步使用权重图 $W=1+(w_{\text{text}}-1)M_{\text{lat}}$ 强化文本区域：
+
+$$
+\mathcal{L}_{\text{grad}}=\|\nabla \tilde R_S-\nabla \tilde R_T\|_1.
+$$
+
+最终锐化项为：
+
+$$
+\mathcal{L}_{\text{sharp}}=\lambda_{\text{ffl}}\mathcal{L}_{\text{ffl}}+\lambda_{\text{grad}}\mathcal{L}_{\text{grad}}.
+$$
+
+该设计的核心是：频域约束只作用于“编辑所引入的变化（残差）”，从而更直接优化笔画细节，同时避免对背景纹理频谱的过拟合。
+
+最终总损失为：
+
+$$
+\mathcal{L}_{\text{total}}=
+\mathcal{L}_{\text{LCM}'}+
+\lambda_1\mathcal{L}_{\text{attn}}+
+\lambda_2\mathcal{L}_{\text{ocr}}+
+\lambda_3\mathcal{L}_{\text{topo}}+
+\lambda_4\mathcal{L}_{\text{sharp}}.
+$$
+
+与实现一致的训练策略说明：  
+当前实现采用常量权重 $\lambda_i$（由配置文件给定），并通过“间隔触发/门控”控制额外约束的开销与稳定性：例如 attention 每 `attn_every` 步、OCR 每 `ocr_every` 步；attention 还可按噪声强度区间门控。若未来需要显式的分段 warmup（0–10k/10k–30k/30k–50k），应在代码中加入对应的 step-wise 权重调度并在配置中暴露开关；否则论文不应将其表述为“已采用”。
 
 ## 4 实验
 
@@ -112,9 +351,10 @@ FlashGlyph 采用教师—学生蒸馏结构。教师模型 T 为冻结的 AnyTe
 数据集中约 160 万张为中文、139 万张为英文，约 1 万张为其他语言（如日语、韩语、阿拉伯语、孟加拉语与印地语）。此外，作者从 Wukong 与 LAION 子集中随机抽取 1000 张构建评估集 AnyText-benchmark，用于评估中英文生成准确性与质量；其余样本作为训练集 AnyWord-3M。
 
 评测以可读性为核心。使用外部 OCR/STR 模型评估输出，计算 Char Acc、Word Acc、CER/WER 等。
+外部 OCR 评测脚本与复现命令见 `eval/README_OCR_EVAL.md`（PARSeq/TrOCR 及其平均口径）。
 
 **重要：训练/测试识别器解耦协议**。为确保评测公平性，本文严格区分训练用识别器与测试用识别器：
-- 训练阶段：使用冻结的 PP-OCR v3 识别器计算 CTC 监督损失（参数冻结，梯度仅回传至学生模型）
+- 训练阶段：使用 AnyText2 checkpoint 内置的冻结 OCR 识别器 $\mathcal{R}$（工程上为 PP-OCR 风格 CTC 识别器；OCR 权重随 AnyText2 主模型一并加载，无需单独的 `ppv3_rec.pth` 文件）计算 CTC 监督损失，梯度仅回传至学生 LoRA 参数
 - 测试阶段：使用独立的 PARSeq 与 TrOCR 识别器进行评测，并报告多模型平均值
 - 该协议避免"同识别器训练又测试"的同构偏置，确保可读性提升来自模型泛化而非识别器过拟合
 
@@ -122,7 +362,7 @@ FlashGlyph 采用教师—学生蒸馏结构。教师模型 T 为冻结的 AnyTe
 
 ### 4.2 实现细节
 
-教师模型为 AnyText2 checkpoint；学生为同构网络 + LoRA。时间表采用 DDIM 50 步，推理步数固定为 4，并可扩展报告 1/2 步。优化器采用 AdamW，混合精度训练。注意力蒸馏在可记录注意力权重的实现路径下启用；OCR 约束默认每 k 步触发一次；拓扑约束通过有限迭代的 soft-skeletonization 计算。**论文主线训练配置为 `student_model_v3/configs/lcm_v3.yaml`（Attn+OCR+clDice），`ablation_A4.yaml` 仅作为可选抛光/消融配置（FFL+Grad）**。
+教师模型为 AnyText2 checkpoint；学生为同构网络 + LoRA。时间表采用 DDIM 50 步，推理步数固定为 4，并可扩展报告 1/2 步。优化器采用 AdamW，混合精度训练。注意力蒸馏在可记录注意力权重的实现路径下启用；OCR 约束默认每 k 步触发一次；拓扑约束通过有限迭代的 soft-skeletonization 计算。锐化项（FFL+Grad）在 `ablation_A4.yaml` / `lcm_v3_gl.yaml` 中开启，FFL 使用 residual-windowed 版本。**论文主线训练配置为 `student_model_v3/configs/lcm_v3.yaml`（Attn+OCR+clDice），`ablation_A4.yaml` 仅作为可选抛光/消融配置（FFL+Grad）**。
 
 ### 4.3 主结果与对比
 
@@ -132,37 +372,37 @@ FlashGlyph 采用教师—学生蒸馏结构。教师模型 T 为冻结的 AnyTe
 
 | 方法 | 步数 | 延迟 (ms) | 加速比 | Char Acc ↑ | Word Acc ↑ | CER ↓ | WER ↓ | FID ↓ | LPIPS ↓ |
 |-----|----:|----:|----:|----:|----:|----:|----:|----:|----:|
-| AnyText2 (Teacher) | 50 | ~8700 | 1.0× | **94.1%** | **89.3%** | **5.9%** | **10.7%** | **11.8** | **0.112** |
-| DDIM-4step | 4 | ~700 | 12.4× | 58.3% | 42.1% | 41.7% | 57.9% | 52.3 | 0.387 |
-| DDIM-10step | 10 | ~1750 | 5.0× | 71.2% | 58.4% | 28.8% | 41.6% | 34.7 | 0.268 |
-| DPM-Solver-10 | 10 | ~780 | 11.2× | 73.5% | 61.7% | 26.5% | 38.3% | 31.2 | 0.241 |
-| DPM-Solver-15 | 15 | ~1170 | 7.4× | 78.9% | 68.3% | 21.1% | 31.7% | 24.8 | 0.198 |
-| UniPC-10 | 10 | ~810 | 10.7× | 74.8% | 62.9% | 25.2% | 37.1% | 29.6 | 0.233 |
-| LCM-baseline (no mask) | 4 | ~680 | 12.8× | 75.2% | 63.4% | 24.8% | 36.6% | 26.7 | 0.217 |
-| LCM-baseline (mask) | 4 | ~680 | 12.8× | 79.8% | 69.1% | 20.2% | 30.9% | 23.1 | 0.192 |
-| FlashGlyph (ours) | 4 | ~710 | 12.3× | 87.6% | 79.4% | 12.4% | 20.6% | 17.9 | 0.158 |
-| FlashGlyph (2-step) | 2 | ~360 | 24.2× | 81.3% | 71.2% | 18.7% | 28.8% | 21.4 | 0.176 |
-| FlashGlyph (1-step) | 1 | **~180** | **48.3×** | 72.8% | 60.1% | 27.2% | 39.9% | 28.7 | 0.215 |
+| AnyText2 (Teacher) | 50 | ~10440 | 1.0× | **94.1%** | **89.3%** | **5.9%** | **10.7%** | **11.8** | **0.112** |
+| DDIM-4step | 4 | ~840 | 12.4× | 58.3% | 42.1% | 41.7% | 57.9% | 52.3 | 0.387 |
+| DDIM-10step | 10 | ~2100 | 5.0× | 71.2% | 58.4% | 28.8% | 41.6% | 34.7 | 0.268 |
+| DPM-Solver-10 | 10 | ~936 | 11.2× | 73.5% | 61.7% | 26.5% | 38.3% | 31.2 | 0.241 |
+| DPM-Solver-15 | 15 | ~1404 | 7.4× | 78.9% | 68.3% | 21.1% | 31.7% | 24.8 | 0.198 |
+| UniPC-10 | 10 | ~972 | 10.7× | 74.8% | 62.9% | 25.2% | 37.1% | 29.6 | 0.233 |
+| LCM-baseline (no mask) | 4 | ~816 | 12.8× | 75.2% | 63.4% | 24.8% | 36.6% | 26.7 | 0.217 |
+| LCM-baseline (mask) | 4 | ~816 | 12.8× | 79.8% | 69.1% | 20.2% | 30.9% | 23.1 | 0.192 |
+| FlashGlyph (ours) | 4 | ~852 | 12.3× | 87.6% | 79.4% | 12.4% | 20.6% | 17.9 | 0.158 |
+| FlashGlyph (2-step) | 2 | ~432 | 24.2× | 81.3% | 71.2% | 18.7% | 28.8% | 21.4 | 0.176 |
+| FlashGlyph (1-step) | 1 | **~216** | **48.3×** | 72.8% | 60.1% | 27.2% | 39.9% | 28.7 | 0.215 |
 no-mask 配置见 ablation_A0_nomask.yaml。
-评测口径：PARSeq+TrOCR 平均；延迟为 UNet-only（batch=1，预热10次）。
+评测口径：PARSeq+TrOCR 平均；延迟为单卡 RTX 4090 UNet-only 估算（batch=1，预热10次）。
 
 **表 1b 英文测试集主实验定量对比（预测）【待修改】**
 
 | 方法 | 步数 | 延迟 (ms) | 加速比 | Char Acc ↑ | Word Acc ↑ | CER ↓ | WER ↓ | FID ↓ | LPIPS ↓ |
 |-----|----:|----:|----:|----:|----:|----:|----:|----:|----:|
-| AnyText2 (Teacher) | 50 | ~8500 | 1.0× | **95.7%** | **91.2%** | **4.3%** | **8.8%** | **10.9** | **0.098** |
-| DDIM-4step | 4 | ~680 | 12.5× | 62.1% | 47.3% | 37.9% | 52.7% | 47.8 | 0.342 |
-| DDIM-10step | 10 | ~1700 | 5.0× | 74.8% | 62.1% | 25.2% | 37.9% | 31.2 | 0.241 |
-| DPM-Solver-10 | 10 | ~760 | 11.2× | 76.9% | 65.4% | 23.1% | 34.6% | 28.7 | 0.218 |
-| DPM-Solver-15 | 15 | ~1140 | 7.5× | 82.1% | 71.8% | 17.9% | 28.2% | 22.3 | 0.181 |
-| UniPC-10 | 10 | ~790 | 10.8× | 78.3% | 67.2% | 21.7% | 32.8% | 26.8 | 0.207 |
-| LCM-baseline (no mask) | 4 | ~660 | 12.9× | 78.7% | 68.9% | 21.3% | 31.1% | 24.1 | 0.193 |
-| LCM-baseline (mask) | 4 | ~660 | 12.9× | 82.4% | 73.7% | 17.6% | 26.3% | 20.8 | 0.171 |
-| FlashGlyph (ours) | 4 | ~690 | 12.3× | 89.3% | 82.9% | 10.7% | 17.1% | 15.7 | 0.139 |
-| FlashGlyph (2-step) | 2 | ~350 | 24.3× | 83.7% | 75.1% | 16.3% | 24.9% | 19.2 | 0.156 |
-| FlashGlyph (1-step) | 1 | **~170** | **50.0×** | 75.2% | 64.3% | 24.8% | 35.7% | 25.3 | 0.192 |
+| AnyText2 (Teacher) | 50 | ~10200 | 1.0× | **95.7%** | **91.2%** | **4.3%** | **8.8%** | **10.9** | **0.098** |
+| DDIM-4step | 4 | ~816 | 12.5× | 62.1% | 47.3% | 37.9% | 52.7% | 47.8 | 0.342 |
+| DDIM-10step | 10 | ~2040 | 5.0× | 74.8% | 62.1% | 25.2% | 37.9% | 31.2 | 0.241 |
+| DPM-Solver-10 | 10 | ~912 | 11.2× | 76.9% | 65.4% | 23.1% | 34.6% | 28.7 | 0.218 |
+| DPM-Solver-15 | 15 | ~1368 | 7.5× | 82.1% | 71.8% | 17.9% | 28.2% | 22.3 | 0.181 |
+| UniPC-10 | 10 | ~948 | 10.8× | 78.3% | 67.2% | 21.7% | 32.8% | 26.8 | 0.207 |
+| LCM-baseline (no mask) | 4 | ~792 | 12.9× | 78.7% | 68.9% | 21.3% | 31.1% | 24.1 | 0.193 |
+| LCM-baseline (mask) | 4 | ~792 | 12.9× | 82.4% | 73.7% | 17.6% | 26.3% | 20.8 | 0.171 |
+| FlashGlyph (ours) | 4 | ~828 | 12.3× | 89.3% | 82.9% | 10.7% | 17.1% | 15.7 | 0.139 |
+| FlashGlyph (2-step) | 2 | ~420 | 24.3× | 83.7% | 75.1% | 16.3% | 24.9% | 19.2 | 0.156 |
+| FlashGlyph (1-step) | 1 | **~204** | **50.0×** | 75.2% | 64.3% | 24.8% | 35.7% | 25.3 | 0.192 |
 no-mask 配置见 ablation_A0_nomask.yaml。
-评测口径：PARSeq+TrOCR 平均；延迟为 UNet-only（batch=1，预热10次）。
+评测口径：PARSeq+TrOCR 平均；延迟为单卡 RTX 4090 UNet-only 估算（batch=1，预热10次）。
 
 **表 1c 结构指标辅助对比（中文，附录）（预测）【待修改】**
 
@@ -172,13 +412,14 @@ no-mask 配置见 ablation_A0_nomask.yaml。
 | LCM-baseline (mask) | 0.41 | 0.52 | 18.7% |
 | FlashGlyph (ours) | 0.59 | 0.71 | 5.3% |
 
-评测口径：PARSeq+TrOCR 平均；延迟为 UNet-only（batch=1，预热10次）。
+评测口径：PARSeq+TrOCR 平均；延迟为单卡 RTX 4090 UNet-only 估算（batch=1，预热10次）。
 
 **评测环境说明**：
-- 硬件：NVIDIA A100 (40GB)
+- 硬件：NVIDIA RTX 4090 ×3 (24GB)
 - 软件：PyTorch 2.0, CUDA 11.8
-- 延迟测量：纯UNet推理时间（不含VAE编解码），batch=1，预热10次取平均
-- OCR测试：PARSeq + TrOCR 平均值（训练使用PP-OCR v3，严格解耦）
+- 训练/评测：3× RTX 4090 数据并行
+- 延迟测量：单卡 RTX 4090 纯UNet推理时间估算（不含VAE编解码），batch=1，预热10次取平均
+- OCR测试：PARSeq + TrOCR 平均值（训练使用 AnyText2 内置冻结 OCR 识别器，严格解耦）
 
 ![图 4 主结果定性对比（建议：Teacher vs LCM baseline vs FlashGlyph，附局部放大与 OCR 识别字符串）。](figures/fig4.png)
 
@@ -186,29 +427,29 @@ no-mask 配置见 ablation_A0_nomask.yaml。
 
 ### 4.4 消融实验与分析
 
-消融实验按模块逐步叠加：A0 LCM baseline → A1 +Attention → A2 +OCR → A3 +Topology → A4 +Sharpness。除平均指标外，还统计结构崩溃样本率（CER > 30%定义为结构崩溃）以量化稳定性。
+消融实验按模块逐步叠加：LCM baseline（mask 加权） → +Attention → +Attention + OCR → +Attention + OCR + Topology → +Attention + OCR + Topology + Sharpness（FFL+Grad）。除平均指标外，还统计结构崩溃样本率（CER > 30%定义为结构崩溃）以量化稳定性。
 
 **表 2a 组件消融实验（中文）（预测）【待修改】**
 
-| 变体 | 配置 | Char Acc ↑ | Word Acc ↑ | CER ↓ | FID ↓ | 边缘清晰度 ↑ | clDice ↑ | 结构崩溃率 ↓ |
-|-----|------:|------:|------:|------:|------:|------:|------:|------:|
-| A0 | ablation_A0.yaml | 79.8% | 69.1% | 20.2% | 23.1 | 0.41 | 0.52 | 18.7% |
-| A1 | ablation_A1.yaml | 82.3% | 72.4% | 17.7% | 22.8 | 0.43 | 0.54 | 14.2% |
-| A2 | ablation_A2.yaml | 85.7% | 77.8% | 14.3% | 21.7 | 0.44 | 0.56 | 11.8% |
-| A3 | ablation_A3.yaml | 87.1% | 78.9% | 12.9% | 19.2 | 0.51 | 0.68 | 7.3% |
-| A4 | ablation_A4.yaml | **87.6%** | **79.4%** | **12.4%** | **17.9** | **0.59** | **0.71** | **5.3%** |
-评测口径：PARSeq+TrOCR 平均；延迟为 UNet-only（batch=1，预热10次）。
+| 变体 | Char Acc ↑ | Word Acc ↑ | CER ↓ | FID ↓ | 边缘清晰度 ↑ | clDice ↑ | 结构崩溃率 ↓ |
+|-----|------:|------:|------:|------:|------:|------:|------:|
+| LCM baseline（mask 加权） | 79.8% | 69.1% | 20.2% | 23.1 | 0.41 | 0.52 | 18.7% |
+| +Attention | 82.3% | 72.4% | 17.7% | 22.8 | 0.43 | 0.54 | 14.2% |
+| +Attention + OCR | 85.7% | 77.8% | 14.3% | 21.7 | 0.44 | 0.56 | 11.8% |
+| +Attention + OCR + Topology | 87.1% | 78.9% | 12.9% | 19.2 | 0.51 | 0.68 | 7.3% |
+| +Attention + OCR + Topology + Sharpness（FFL+Grad） | **87.6%** | **79.4%** | **12.4%** | **17.9** | **0.59** | **0.71** | **5.3%** |
+评测口径：PARSeq+TrOCR 平均；延迟为单卡 RTX 4090 UNet-only 估算（batch=1，预热10次）。
 
 **表 2b 组件消融实验（英文）（预测）【待修改】**
 
-| 变体 | 配置 | Char Acc ↑ | Word Acc ↑ | CER ↓ | FID ↓ | 边缘清晰度 ↑ | clDice ↑ | 结构崩溃率 ↓ |
-|-----|------:|------:|------:|------:|------:|------:|------:|------:|
-| A0 | ablation_A0.yaml | 82.4% | 73.7% | 17.6% | 20.8 | 0.43 | 0.54 | 16.3% |
-| A1 | ablation_A1.yaml | 84.9% | 76.8% | 15.1% | 20.5 | 0.45 | 0.56 | 12.1% |
-| A2 | ablation_A2.yaml | 87.6% | 80.1% | 12.4% | 19.6 | 0.46 | 0.58 | 9.7% |
-| A3 | ablation_A3.yaml | 88.9% | 81.7% | 11.1% | 17.1 | 0.53 | 0.70 | 6.1% |
-| A4 | ablation_A4.yaml | **89.3%** | **82.9%** | **10.7%** | **15.7** | **0.61** | **0.73** | **4.8%** |
-评测口径：PARSeq+TrOCR 平均；延迟为 UNet-only（batch=1，预热10次）。
+| 变体 | Char Acc ↑ | Word Acc ↑ | CER ↓ | FID ↓ | 边缘清晰度 ↑ | clDice ↑ | 结构崩溃率 ↓ |
+|-----|------:|------:|------:|------:|------:|------:|------:|
+| LCM baseline（mask 加权） | 82.4% | 73.7% | 17.6% | 20.8 | 0.43 | 0.54 | 16.3% |
+| +Attention | 84.9% | 76.8% | 15.1% | 20.5 | 0.45 | 0.56 | 12.1% |
+| +Attention + OCR | 87.6% | 80.1% | 12.4% | 19.6 | 0.46 | 0.58 | 9.7% |
+| +Attention + OCR + Topology | 88.9% | 81.7% | 11.1% | 17.1 | 0.53 | 0.70 | 6.1% |
+| +Attention + OCR + Topology + Sharpness（FFL+Grad） | **89.3%** | **82.9%** | **10.7%** | **15.7** | **0.61** | **0.73** | **4.8%** |
+评测口径：PARSeq+TrOCR 平均；延迟为单卡 RTX 4090 UNet-only 估算（batch=1，预热10次）。
 
 **消融分析**：
 - **Attention 对齐**：主要提升位置准确性，减少重影与漂移（+2.5% Char Acc，结构崩溃率-4.5%）
@@ -220,38 +461,40 @@ no-mask 配置见 ablation_A0_nomask.yaml。
 
 | 方法 | 可训练参数 | 训练时间 (50k steps) | 推理额外开销 | 显存占用 (训练) |
 |-----|----------:|---------------------:|------------:|--------------:|
-| LCM-baseline | ~87M | ~18h (1× A100-40G) | 0% | 8.2GB |
-| +Attention | ~87M | ~19h (+5%) | +2% | 8.4GB |
-| +OCR | ~87M | ~21h (+16%) | +8% | 9.1GB |
-| +Topology | ~87M | ~22h (+22%) | +5% | 8.6GB |
-| +Sharpness | ~87M | ~22h (+22%) | +3% | 8.5GB |
+| LCM-baseline | ~87M | ~20h (3× RTX 4090) | 0% | 8.2GB |
+| +Attention | ~87M | ~21h (+5%) | +2% | 8.4GB |
+| +OCR | ~87M | ~23h (+16%) | +8% | 9.1GB |
+| +Topology | ~87M | ~24h (+22%) | +5% | 8.6GB |
+| +Sharpness | ~87M | ~24h (+22%) | +3% | 8.5GB |
 
 **说明**：
 - LoRA rank=64，alpha=64，注入UNet与ControlNet的attention层及zero_convs
 - 基础模型（AnyText2）总参数约860M，LoRA可训练参数约87M（~10%）
+- 可训练参数为按 LoRA 注入模块参数量估算，非脚本统计
 - 训练配置：batch_size=4, gradient_accumulation=4, 有效batch=16, fp16混合精度
-- 显存占用为fp16训练时的峰值GPU内存（A100-40G实测）
+- 显存占用为fp16训练时的峰值GPU内存（RTX 4090 24GB 估算）
 
 **表 4 不同推理步数的速度-质量权衡（中文）（预测）【待修改】**
 
 | 步数 | 延迟 (ms) | 中文 Char Acc ↑ | FID ↓ | 适用场景 |
 |----:|---------:|--------------:|------:|---------|
-| 1 | **~180** | 72.8% | 28.7 | 实时预览 |
-| 2 | ~360 | 81.3% | 21.4 | 交互式编辑 |
-| 4 | ~710 | 87.6% | 17.9 | 标准模式 |
-| 8 | ~1420 | 90.7% | 14.3 | 高质量模式 |
-| 50 | ~8700 | **94.1%** | **11.8** | 离线渲染 |
-评测口径：PARSeq+TrOCR 平均；延迟为 UNet-only（batch=1，预热10次）。
+| 1 | **~216** | 72.8% | 28.7 | 实时预览 |
+| 2 | ~432 | 81.3% | 21.4 | 交互式编辑 |
+| 4 | ~852 | 87.6% | 17.9 | 标准模式 |
+| 8 | ~1704 | 90.7% | 14.3 | 高质量模式 |
+| 50 | ~10440 | **94.1%** | **11.8** | 离线渲染 |
+评测口径：PARSeq+TrOCR 平均；延迟为单卡 RTX 4090 UNet-only 估算（batch=1，预热10次）。
 
-![图 5 消融可视化（建议：A0-A3 每阶段展示位置漂移、语义错字、断笔/粘连的修复过程）。](figures/fig5.png)
+![图 5 消融可视化（建议：baseline → +Attention → +OCR → +Topology，每阶段展示位置漂移、语义错字、断笔/粘连的修复过程）。](figures/fig5.png)
 
-*图 5 消融可视化（建议：A0-A3 每阶段展示位置漂移、语义错字、断笔/粘连的修复过程）。*
+*图 5 消融可视化（建议：baseline → +Attention → +OCR → +Topology，每阶段展示位置漂移、语义错字、断笔/粘连的修复过程）。*
 
 ### 4.5 结果来源与可追溯性
 
 本仓库已为表格建立“可追溯映射”，并提供当前阶段的预测填充数据（用于文档对齐与路径约定）。对应文件如下：
 
 - 表格映射总表：`student_model_v3/experiments/TABLE_SOURCES.md`
+- OCR评测说明与命令：`eval/README_OCR_EVAL.md`
 - 预测填充数据（CSV）：`student_model_v3/experiments/predicted/table1a_cn_predicted.csv`、`student_model_v3/experiments/predicted/table1b_en_predicted.csv`、`student_model_v3/experiments/predicted/table2_cn_predicted.csv`、`student_model_v3/experiments/predicted/table2_en_predicted.csv`、`student_model_v3/experiments/predicted/table4_cn_predicted.csv`
 - 预测数据摘要：`student_model_v3/experiments/predicted/predicted_summary.json`
 

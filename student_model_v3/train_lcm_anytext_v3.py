@@ -1265,7 +1265,12 @@ def main():
                     loss_ffl = lcm_loss.new_tensor(0.0)
                     loss_grad = lcm_loss.new_tensor(0.0)
                     if high_freq_loss is not None:
-                        hf_total, hf_dict = high_freq_loss(teacher_guided_pred_x0, pred_x0_target, mask=text_mask)
+                        hf_total, hf_dict = high_freq_loss(
+                            pred_x0=student_pred_x0,
+                            target_x0=teacher_guided_pred_x0.detach(),
+                            mask=text_mask,
+                            masked_x=cond_batch["masked_x"],
+                        )
                         loss = loss + hf_total
                         loss_ffl = hf_dict["ffl"]
                         loss_grad = hf_dict["grad"]

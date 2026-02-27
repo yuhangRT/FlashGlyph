@@ -69,6 +69,8 @@ train:
   stroke_k: 12.0
   loss_ffl_weight: 0.0
   loss_grad_weight: 0.0
+  loss_mask_key: hint
+  loss_text_weight: 1.0
   logging_steps: 10
   log_image_steps: 500
   log_image_samples: 4

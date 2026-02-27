@@ -13,8 +13,8 @@ Generated from in-repo paper numbers (pre-fill only).
 
 | method | steps | latency_ms | char_acc | fid | image_dir | ocr_json |
 |---|---:|---:|---:|---:|---|---|
-| AnyText2 (Teacher) | 50 | 8700 | 94.1 | 11.8 | student_model_v3/experiments/generated/teacher50_cn | student_model_v3/experiments/results/table1a_cn_teacher50_parseq_trocr.json |
-| DDIM-4step | 4 | 700 | 58.3 | 52.3 | student_model_v3/experiments/generated/ddim4_cn | student_model_v3/experiments/results/table1a_cn_ddim4_parseq_trocr.json |
-| DDIM-10step | 10 | 1750 | 71.2 | 34.7 | student_model_v3/experiments/generated/ddim10_cn | student_model_v3/experiments/results/table1a_cn_ddim10_parseq_trocr.json |
-| DPM-Solver-10 | 10 | 780 | 73.5 | 31.2 | student_model_v3/experiments/generated/dpmsolver10_cn | student_model_v3/experiments/results/table1a_cn_dpmsolver10_parseq_trocr.json |
-| DPM-Solver-15 | 15 | 1170 | 78.9 | 24.8 | student_model_v3/experiments/generated/dpmsolver15_cn | student_model_v3/experiments/results/table1a_cn_dpmsolver15_parseq_trocr.json |
+| AnyText2 (Teacher) | 50 | 10440 | 94.1 | 11.8 | student_model_v3/experiments/generated/teacher50_cn | student_model_v3/experiments/results/table1a_cn_teacher50_parseq_trocr.json |
+| DDIM-4step | 4 | 840 | 58.3 | 52.3 | student_model_v3/experiments/generated/ddim4_cn | student_model_v3/experiments/results/table1a_cn_ddim4_parseq_trocr.json |
+| DDIM-10step | 10 | 2100 | 71.2 | 34.7 | student_model_v3/experiments/generated/ddim10_cn | student_model_v3/experiments/results/table1a_cn_ddim10_parseq_trocr.json |
+| DPM-Solver-10 | 10 | 936 | 73.5 | 31.2 | student_model_v3/experiments/generated/dpmsolver10_cn | student_model_v3/experiments/results/table1a_cn_dpmsolver10_parseq_trocr.json |
+| DPM-Solver-15 | 15 | 1404 | 78.9 | 24.8 | student_model_v3/experiments/generated/dpmsolver15_cn | student_model_v3/experiments/results/table1a_cn_dpmsolver15_parseq_trocr.json |

@@ -1,6 +1,6 @@
-variant,config,char_acc,word_acc,cer,fid,edge,cldice,collapse
-A0,student_model_v3/configs/ablation_A0.yaml,82.4,73.7,17.6,20.8,0.43,0.54,16.3
-A1,student_model_v3/configs/ablation_A1.yaml,84.9,76.8,15.1,20.5,0.45,0.56,12.1
-A2,student_model_v3/configs/ablation_A2.yaml,87.6,80.1,12.4,19.6,0.46,0.58,9.7
-A3,student_model_v3/configs/lcm_v3.yaml (FFL/Grad=0),88.9,81.7,11.1,17.1,0.53,0.7,6.1
-A4,student_model_v3/configs/lcm_v3_gl.yaml,89.3,82.9,10.7,15.7,0.61,0.73,4.8
+variant,char_acc,word_acc,cer,fid,edge,cldice,collapse
+LCM baseline (mask-weighted),82.4,73.7,17.6,20.8,0.43,0.54,16.3
++Attention,84.9,76.8,15.1,20.5,0.45,0.56,12.1
++Attention + OCR,87.6,80.1,12.4,19.6,0.46,0.58,9.7
++Attention + OCR + Topology,88.9,81.7,11.1,17.1,0.53,0.70,6.1
++Attention + OCR + Topology + Sharpness (FFL+Grad),89.3,82.9,10.7,15.7,0.61,0.73,4.8

@@ -124,6 +124,39 @@ class HighFreqTextLoss(nn.Module):
             "kernel_y",
             torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3),
         )
+        self.register_buffer("gaussian_kernel", self._build_gaussian_kernel(kernel_size=5, sigma=1.0))
+
+    @staticmethod
+    def _build_gaussian_kernel(kernel_size=5, sigma=1.0):
+        coords = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+        gauss_1d = torch.exp(-(coords**2) / (2 * sigma**2))
+        gauss_1d = gauss_1d / gauss_1d.sum()
+        kernel_2d = torch.outer(gauss_1d, gauss_1d)
+        return kernel_2d.view(1, 1, kernel_size, kernel_size)
+
+    @staticmethod
+    def _prepare_mask(mask, spatial_size, device, dtype):
+        if mask is None:
+            return None
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        if mask.dim() == 4 and mask.shape[1] > 1:
+            mask = mask.max(dim=1, keepdim=True).values
+        if mask.shape[-2:] != spatial_size:
+            mask = F.interpolate(mask, size=spatial_size, mode="nearest")
+        return (mask.to(device=device, dtype=dtype) > 0.5).float()
+
+    def _build_soft_window(self, mask):
+        if mask is None:
+            return None
+        window = mask
+        # Expand text support a bit, then smooth to reduce spectral ringing.
+        window = F.max_pool2d(window, kernel_size=3, stride=1, padding=1)
+        window = F.max_pool2d(window, kernel_size=3, stride=1, padding=1)
+        c = window.shape[1]
+        kernel = self.gaussian_kernel.to(device=window.device, dtype=window.dtype).repeat(c, 1, 1, 1)
+        window = F.conv2d(window, kernel, padding=kernel.shape[-1] // 2, groups=c)
+        return window.clamp(0.0, 1.0)
 
     def masked_gradient_loss(self, pred, target, mask=None):
         pred_f = pred.float()
@@ -152,14 +185,42 @@ class HighFreqTextLoss(nn.Module):
 
         return loss.mean()
 
-    def forward(self, pred_x0, target_x0, mask=None):
+    def forward(
+        self,
+        pred_x0,
+        target_x0,
+        mask=None,
+        masked_x=None,
+        use_residual=True,
+        use_soft_window=True,
+    ):
+        pred = pred_x0.float()
+        target = target_x0.float()
+        mask_lat = self._prepare_mask(mask, pred.shape[-2:], pred.device, pred.dtype)
+
+        if use_residual and masked_x is not None:
+            masked = masked_x.float().to(device=pred.device, dtype=pred.dtype)
+            if masked.shape[-2:] != pred.shape[-2:]:
+                masked = F.interpolate(masked, size=pred.shape[-2:], mode="nearest")
+            if masked.shape[1] != pred.shape[1]:
+                if masked.shape[1] == 1:
+                    masked = masked.repeat(1, pred.shape[1], 1, 1)
+                else:
+                    raise ValueError("masked_x channel count must match pred_x0 or be 1")
+            pred = pred - masked
+            target = target - masked
+
+        soft_window = self._build_soft_window(mask_lat) if (mask_lat is not None and use_soft_window) else mask_lat
+
         loss_ffl = pred_x0.new_tensor(0.0)
         loss_grad = pred_x0.new_tensor(0.0)
 
         if self.ffl_weight > 0:
-            loss_ffl = self.ffl(pred_x0.float(), target_x0.float())
+            pred_ffl = pred * soft_window if soft_window is not None else pred
+            target_ffl = target * soft_window if soft_window is not None else target
+            loss_ffl = self.ffl(pred_ffl, target_ffl)
         if self.grad_weight > 0:
-            loss_grad = self.masked_gradient_loss(pred_x0, target_x0, mask)
+            loss_grad = self.masked_gradient_loss(pred, target, mask_lat)
 
         total_loss = self.ffl_weight * loss_ffl + self.grad_weight * loss_grad
         return total_loss, {"ffl": loss_ffl, "grad": loss_grad}
