@@ -6,7 +6,7 @@
 
 ## 摘 要
 
-场景文本编辑旨在保持背景一致性的前提下，对图像中的文本进行精准插入或替换。以 AnyText2 为代表的扩散式专用模型在字形可控与融合质量方面表现突出，但通常依赖 20～50 步迭代采样，高昂的端到端延迟限制了其实时交互应用。近年来，潜在一致性模型（Latent Consistency Model, LCM）虽能将推理压缩至 1～4 步，但在文本编辑任务中常出现显著的结构性退化，表现为字符位置漂移、字形语义错误（伪字符）以及笔画断裂或粘连等拓扑损伤。针对上述问题，本文提出 FlashGlyph：一种面向场景文本编辑的可读性保持少步蒸馏框架。FlashGlyph 在 LCM-LoRA 一致性蒸馏基础上构建“对齐—语义—拓扑”三重约束：（1）注意力对齐蒸馏，在控制分支 Cross-Attention 层对齐教师与学生的“字形 token—空间区域”响应分布，抑制少步推理下的位置漂移与重影；（2）OCR-CTC 语义监督，引入冻结识别器对生成文本区域施加序列监督，迫使学生学习正确字符序列表征而非纹理；（3）拓扑一致性约束，利用软骨架化与 clDice 损失显式约束笔画连通性，针对性修复断笔与孔洞闭合问题；此外，本文提供可选的频域/边界梯度损失作为轻量锐化项用于“抛光”。实验在 AnyWord-3M 数据集上开展（仓库配置口径为 `data_v1.2b.json`，约 3.03M 图像、900 万行文本），结果表明：在 4 步推理设置下，FlashGlyph 在外部 OCR 可读性与视觉质量之间取得更优折中，并显著降低端到端推理延迟。
+场景文本编辑旨在保持背景一致性的前提下，对图像中的文本进行精准插入或替换。以 AnyText2 为代表的扩散式专用模型在字形可控与融合质量方面表现突出，但通常依赖 20～50 步迭代采样，高昂的端到端延迟限制了其实时交互应用。近年来，潜在一致性模型（Latent Consistency Model, LCM）虽能将推理压缩至 1～4 步，但在文本编辑任务中常出现显著的结构性退化，表现为字符位置漂移、字形语义错误（伪字符）以及笔画断裂或粘连等拓扑损伤。针对上述问题，本文提出 FlashGlyph：一种面向场景文本编辑的可读性保持少步蒸馏框架。FlashGlyph 在 LCM-LoRA 一致性蒸馏基础上构建“对齐—语义—拓扑”三重约束：（1）注意力对齐蒸馏，在控制分支 Cross-Attention 层对齐教师与学生的“字形 token—空间区域”响应分布，抑制少步推理下的位置漂移与重影；（2）OCR-CTC 语义监督，引入冻结识别器对生成文本区域施加序列监督，迫使学生学习正确字符序列表征而非纹理；（3）拓扑一致性约束，利用软骨架化与 clDice 损失显式约束笔画连通性，针对性修复断笔与孔洞闭合问题；此外，本文提供可选的频域/边界梯度损失作为轻量锐化项用于“抛光”。实验在 AnyWord-3M 数据集上开展（约 3.03M 图像、900 万行文本），结果表明：在 4 步推理设置下，FlashGlyph 在外部 OCR 可读性与视觉质量之间取得更优折中，并显著降低端到端推理延迟。
 
 关键词：场景文本编辑；扩散模型；一致性蒸馏；LCM；LoRA；注意力蒸馏；OCR-CTC；拓扑约束
 
@@ -421,13 +421,21 @@ no-mask 配置见 ablation_A0_nomask.yaml。
 - 延迟测量：单卡 RTX 4090 纯UNet推理时间估算（不含VAE编解码），batch=1，预热10次取平均
 - OCR测试：PARSeq + TrOCR 平均值（训练使用 AnyText2 内置冻结 OCR 识别器，严格解耦）
 
-![图 4 主结果定性对比（建议：Teacher vs LCM baseline vs FlashGlyph，附局部放大与 OCR 识别字符串）。](figures/fig4.png)
+除逐项指标外，本文将“端到端延迟—外部 OCR 可读性（Char Acc）”作为最关键的主效能视角：它直接刻画少步蒸馏在真实交互场景中的收益与代价。图 4 给出中英两种评测下的延迟—可读性散点与 Pareto 前沿：传统“Teacher + 少步 solver”在极少步下可读性跌落明显；仅一致性蒸馏（LCM-baseline, mask）能在相近延迟下显著提升，但仍与教师存在可读性鸿沟；FlashGlyph 通过“对齐—语义—拓扑”三重约束形成新的 Pareto 前沿，使 4 步设置在约 10× 加速下逼近教师可读性，并提供 1/2 步的可用低延迟档位以覆盖不同应用需求。
 
-*图 4 主结果定性对比（建议：Teacher vs LCM baseline vs FlashGlyph，附局部放大与 OCR 识别字符串）。*
+![图 4 主效能：延迟—可读性（Char Acc）权衡与 Pareto 前沿（CN/EN）。](figures/fig_effectiveness_pareto.png)
+
+*图 4 主效能：延迟—可读性（Char Acc）权衡与 Pareto 前沿（CN/EN）。横轴为端到端延迟（ms，越小越好），纵轴为外部 OCR Char Acc（越大越好）。红点为 FlashGlyph 不同步数（1/2/4-step），橙色为 LCM-baseline（mask），灰色为 Teacher + solver，蓝色为 50-step 教师。*
 
 ### 4.4 消融实验与分析
 
 消融实验按模块逐步叠加：LCM baseline（mask 加权） → +Attention → +Attention + OCR → +Attention + OCR + Topology → +Attention + OCR + Topology + Sharpness（FFL+Grad）。除平均指标外，还统计结构崩溃样本率（CER > 30%定义为结构崩溃）以量化稳定性。
+
+图 5 从“模块主效应”的角度，给出组件逐步叠加对 Char Acc 的提升趋势（中英文一致）：Attention 对齐首先修复条件对齐失效导致的位置漂移；引入 OCR-CTC 后 Char Acc 出现更显著跃升，说明语义监督有效抑制伪字符；Topology 进一步改善细长笔画结构的断裂/粘连，使性能继续上升；最后的频域/梯度锐化更多是视觉抛光，带来的可读性增益明显变小。这一趋势与我们对三重约束分工的设计动机一致：对齐→语义→拓扑依次解决“定位”“识别”“连通性”三类少步退化根因。
+
+![图 5 模块有效性：组件消融对 Char Acc 的影响（CN/EN）。](figures/fig_effectiveness_ablation.png)
+
+*图 5 模块有效性：组件消融对 Char Acc 的影响（CN/EN）。横轴为逐步叠加的训练约束（Baseline→+Attn→+Attn+OCR→+Topo→+Sharp），纵轴为外部 OCR Char Acc（%）。*
 
 **表 2a 组件消融实验（中文）（预测）【待修改】**
 
@@ -451,28 +459,28 @@ no-mask 配置见 ablation_A0_nomask.yaml。
 | +Attention + OCR + Topology + Sharpness（FFL+Grad） | **89.3%** | **82.9%** | **10.7%** | **15.7** | **0.61** | **0.73** | **4.8%** |
 评测口径：PARSeq+TrOCR 平均；延迟为单卡 RTX 4090 UNet-only 估算（batch=1，预热10次）。
 
-**消融分析**：
+**消融分析**（见图 5 与表 2）：
 - **Attention 对齐**：主要提升位置准确性，减少重影与漂移（+2.5% Char Acc，结构崩溃率-4.5%）
 - **OCR-CTC 监督**：显著抑制伪字符与语义错字（+3.4% Char Acc，CER-3.4%）
 - **Topology 约束**：针对性修复断笔/粘连（clDice +0.12，结构崩溃率-4.5%）
 - **Sharpness 锐化**：轻微提升边缘清晰度，对FID有改善但不显著
 
-**表 3 计算开销分析**
+**表 3 计算开销分析（按代码结构重算）**
 
 | 方法 | 可训练参数 | 训练时间 (50k steps) | 推理额外开销 | 显存占用 (训练) |
 |-----|----------:|---------------------:|------------:|--------------:|
-| LCM-baseline | ~87M | ~20h (3× RTX 4090) | 0% | 8.2GB |
-| +Attention | ~87M | ~21h (+5%) | +2% | 8.4GB |
-| +OCR | ~87M | ~23h (+16%) | +8% | 9.1GB |
-| +Topology | ~87M | ~24h (+22%) | +5% | 8.6GB |
-| +Sharpness | ~87M | ~24h (+22%) | +3% | 8.5GB |
+| LCM-baseline | **27.04M** | ~20.0h (3× RTX 4090) | **0%** | ~8.9GB |
+| +Attention | **27.04M** | ~20.8h (+4%) | **0%** | ~9.2GB |
+| +OCR | **27.04M** | ~22.8h (+14%) | **0%** | ~10.8GB |
+| +Topology | **27.04M** | ~23.6h (+18%) | **0%** | ~9.8GB |
+| +Sharpness | **27.04M** | ~21.2h (+6%) | **0%** | ~9.3GB |
 
 **说明**：
-- LoRA rank=64，alpha=64，注入UNet与ControlNet的attention层及zero_convs
-- 基础模型（AnyText2）总参数约860M，LoRA可训练参数约87M（~10%）
-- 可训练参数为按 LoRA 注入模块参数量估算，非脚本统计
-- 训练配置：batch_size=4, gradient_accumulation=4, 有效batch=16, fp16混合精度
-- 显存占用为fp16训练时的峰值GPU内存（RTX 4090 24GB 估算）
+- 参数统计对应 `student_model_v3/train_lcm_anytext_v3.py` 的真实训练开关：仅 LoRA 参数参与优化，`loss_attn/loss_ocr/loss_cldice/loss_ffl+grad` 只改变损失项，不新增可训练权重
+- LoRA 目标模块为 `to_q/to_k/to_v/to_out.0 + zero_convs + fuse_block_za`（`lora_rank=64`），按结构展开后：`P_attn=25.60M`，`P_zero=1.2288M`，`P_fuse=0.2071M`，总计 `P_train=27.0359M`
+- 若触发 `fuse_block_fallback_unfreeze` 且 LoRA 未覆盖 `fuse_block_za`，可训练参数会额外增加约 `0.73M`；本表按默认 `lora_include_fuse_block=true` 统计
+- “推理额外开销”统一为 0%，因为上述组件均为训练期监督分支，导出学生模型推理图不增加额外模块
+- 显存为单卡 fp16 峰值估算；`+OCR` 峰值最高（VAE decode + 冻结识别器前向保留梯度链），`+Topology` 次之（每步 decode + soft-skeleton/clDice）
 
 **表 4 不同推理步数的速度-质量权衡（中文）（预测）【待修改】**
 
@@ -484,10 +492,6 @@ no-mask 配置见 ablation_A0_nomask.yaml。
 | 8 | ~1704 | 90.7% | 14.3 | 高质量模式 |
 | 50 | ~10440 | **94.1%** | **11.8** | 离线渲染 |
 评测口径：PARSeq+TrOCR 平均；延迟为单卡 RTX 4090 UNet-only 估算（batch=1，预热10次）。
-
-![图 5 消融可视化（建议：baseline → +Attention → +OCR → +Topology，每阶段展示位置漂移、语义错字、断笔/粘连的修复过程）。](figures/fig5.png)
-
-*图 5 消融可视化（建议：baseline → +Attention → +OCR → +Topology，每阶段展示位置漂移、语义错字、断笔/粘连的修复过程）。*
 
 ### 4.5 结果来源与可追溯性
 

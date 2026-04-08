@@ -1,4 +1,16 @@
 model:
+
+
+
+
+
+
+
+
+
+
+
+
   config: models_yaml/anytext2_sd15.yaml
   teacher_ckpt: models/anytext_v2.0.ckpt
   output_dir: student_model_v3/checkpoints
